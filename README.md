@@ -99,6 +99,41 @@ docker build -t defender .
 docker run --rm -p 8080:8080 defender
 ```
 
+### Playground (Docker Compose)
+
+A TanStack Start + shadcn UI in a second container proxies the scanner API and **parses the JSON payload** into verdicts, hashes, sizes, and signature names.
+
+```bash
+docker compose up --build
+```
+
+| Service | URL | Role |
+| --- | --- | --- |
+| Playground | http://127.0.0.1:3000 | Scan files, look up hashes, inspect parsed responses |
+| Defender | http://127.0.0.1:8080 | HTTP virus-scan API |
+
+The first build compiles Rust and downloads official ClamAV CVDs. Compose waits until `GET /ready` succeeds before starting the UI.
+
+See [`playground/README.md`](playground/README.md) for local `npm run dev` and the parsed-payload field map.
+
+### Scan payload
+
+Successful `POST /scan` and `POST /scan/hash` bodies:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `result` | `"clean"` \| `"infected"` | Verdict |
+| `signature` | string, omitted if clean | ClamAV signature name |
+| `size` | number | Bytes scanned, or the size sent with a hash lookup |
+| `md5` | hex string | Whole-file MD5 (empty on unused hash-lookup algorithms) |
+| `sha1` | hex string | Whole-file SHA-1 |
+| `sha256` | hex string | Whole-file SHA-256 |
+| `duration_us` | number | Engine time in microseconds (not HTTP round-trip) |
+
+`POST /scan/hashes` returns an array of `{ "result", "hash", "signature"? }` (or `{ "error", "line"? }`).
+
+The EICAR test file is harmless text (`X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*`, MD5 `44d88612fea8a8f36de82e1278abb02f`) and should be detected as infected.
+
 ## Configuration
 
 | Variable | Default |

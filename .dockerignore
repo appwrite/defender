@@ -5,3 +5,5 @@
 *.md
 .gitignore
 /data
+/playground
+docker-compose.yml

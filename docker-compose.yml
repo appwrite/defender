@@ -1,0 +1,28 @@
+services:
+  defender:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: appwrite/defender:local
+    ports:
+      - "8080:8080"
+    environment:
+      RUST_LOG: info
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 120s
+
+  playground:
+    build:
+      context: ./playground
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      DEFENDER_URL: http://defender:8080
+    depends_on:
+      defender:
+        condition: service_healthy
