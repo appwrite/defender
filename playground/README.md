@@ -1,6 +1,6 @@
-# Defender playground
+# Defender UI
 
-TanStack Start + shadcn UI for exercising the defender HTTP API. The browser talks to same-origin `/api/*` routes; the Node server proxies those to the scanner (`DEFENDER_URL`).
+Web UI for the defender HTTP API. The browser talks to same-origin `/api/*` routes; the Node server proxies those to the scanner (`DEFENDER_URL`).
 
 ## Run with Docker Compose
 
@@ -10,7 +10,7 @@ From the repository root (first build compiles Rust and downloads ClamAV CVDs):
 docker compose up --build
 ```
 
-- Playground: http://127.0.0.1:3000
+- Playground: http://127.0.0.1:3100 (`PLAYGROUND_PORT` overrides the host port)
 - Defender API: http://127.0.0.1:8080
 
 The playground waits until `GET /ready` succeeds so scans run against a loaded engine.

@@ -20,7 +20,7 @@ services:
       context: ./playground
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "${PLAYGROUND_PORT:-3100}:3000"
     environment:
       DEFENDER_URL: http://defender:8080
     depends_on:

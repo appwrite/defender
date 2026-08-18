@@ -37,11 +37,11 @@ export const Route = createRootRoute({
         content: "width=device-width, initial-scale=1",
       },
       {
-        title: "Defender playground",
+        title: "Defender",
       },
       {
         name: "description",
-        content: "Test the Appwrite defender virus-scan HTTP API.",
+        content: "Scan files and hashes against the official ClamAV databases.",
       },
     ],
     links: [{ rel: "stylesheet", href: appCss }],

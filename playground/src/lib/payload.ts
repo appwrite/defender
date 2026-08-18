@@ -215,7 +215,7 @@ export function formatUnix(seconds: number): string {
   return new Date(seconds * 1000)
     .toISOString()
     .replace("T", " ")
-    .replace("Z", " UTC")
+    .replace(/\.\d+Z$/, " UTC")
 }
 
 export function hashAlgorithm(

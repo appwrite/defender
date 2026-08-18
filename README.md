@@ -101,7 +101,7 @@ docker run --rm -p 8080:8080 defender
 
 ### Playground (Docker Compose)
 
-A TanStack Start + shadcn UI in a second container proxies the scanner API and **parses the JSON payload** into verdicts, hashes, sizes, and signature names.
+A web UI in a second container proxies the scanner API and turns responses into verdicts, hashes, sizes, and signature names.
 
 ```bash
 docker compose up --build
@@ -109,10 +109,10 @@ docker compose up --build
 
 | Service | URL | Role |
 | --- | --- | --- |
-| Playground | http://127.0.0.1:3000 | Scan files, look up hashes, inspect parsed responses |
+| Playground | http://127.0.0.1:3100 | Scan files, look up hashes, inspect parsed responses |
 | Defender | http://127.0.0.1:8080 | HTTP virus-scan API |
 
-The first build compiles Rust and downloads official ClamAV CVDs. Compose waits until `GET /ready` succeeds before starting the UI.
+The first build compiles Rust and downloads official ClamAV CVDs. Compose waits until `GET /ready` succeeds before starting the UI. Set `PLAYGROUND_PORT` to bind the UI to a different host port.
 
 See [`playground/README.md`](playground/README.md) for local `npm run dev` and the parsed-payload field map.
 

@@ -1,7 +1,7 @@
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { createFileRoute } from "@tanstack/react-router"
 import {
-  BugIcon,
+  CircleHelpIcon,
   FileScanIcon,
   HashIcon,
   ListIcon,
@@ -12,16 +12,25 @@ import { toast } from "sonner"
 
 import {
   HashBatchCard,
-  RawJsonCard,
   ScanPayloadCard,
+  TechnicalDetails,
 } from "@/components/scan-result"
+import { ThemeToggle } from "@/components/theme-toggle"
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Card,
+  CardAction,
   CardContent,
   CardDescription,
+  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
@@ -44,10 +53,16 @@ import { Spinner } from "@/components/ui/spinner"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 import { callDefender, type ApiCall } from "@/lib/api"
 import {
   EICAR,
   EICAR_MD5,
+  formatBytes,
   formatCount,
   formatUnix,
   hashAlgorithm,
@@ -59,11 +74,15 @@ import {
   wrapParsed,
 } from "@/lib/payload"
 
-export const Route = createFileRoute("/")({ component: Playground })
+export const Route = createFileRoute("/")({ component: App })
+
+function databaseFileName(name: string) {
+  return /\.(cvd|cld)$/i.test(name) ? name : `${name}.cvd`
+}
 
 type BodyMode = "raw" | "multipart"
 
-function Playground() {
+function App() {
   const health = useQuery({
     queryKey: ["health"],
     queryFn: () => callDefender("/health"),
@@ -85,176 +104,252 @@ function Playground() {
     : null
   const readyParsed = ready.data ? parseReadyPayload(ready.data.json) : null
   const infoParsed = info.data ? parseInfoPayload(info.data.json) : null
-  const upstreamError =
-    parseHealthPayload(health.data?.json)?.status === "ok"
-      ? null
-      : health.data && health.data.status >= 400
-        ? String(
-            (health.data.json as { error?: string } | null)?.error ??
-              `HTTP ${health.data.status}`
-          )
-        : health.error
-          ? health.error.message
-          : null
+  const healthy = healthPayload?.status === "ok"
+  const scannerReady = readyParsed?.ready === true
+  const upstreamError = healthy
+    ? null
+    : health.data && health.data.status >= 400
+      ? String(
+          (health.data.json as { error?: string } | null)?.error ??
+            `HTTP ${health.data.status}`
+        )
+      : health.error
+        ? health.error.message
+        : null
 
   return (
-    <main className="mx-auto flex min-h-svh max-w-5xl flex-col gap-6 p-6">
-      <header className="flex flex-col gap-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <h1 className="font-heading text-2xl font-medium">
-            Defender playground
-          </h1>
-          <Badge variant="outline">TanStack Start + shadcn</Badge>
-        </div>
-        <p className="max-w-2xl text-sm text-muted-foreground">
-          Send files and hashes to the Appwrite defender HTTP API. This UI
-          proxies requests to the scanner container so you can inspect the
-          parsed JSON payload.
-        </p>
-        <div className="flex flex-wrap items-center gap-2">
-          <StatusBadge
-            label="health"
-            ok={healthPayload?.status === "ok"}
-            loading={health.isLoading}
-          />
-          <StatusBadge
-            label="ready"
-            ok={readyParsed?.ready === true}
-            loading={ready.isLoading}
-          />
-          {readyParsed ? (
-            <Badge variant="secondary">
-              {formatCount(readyParsed.fileHashes)} file hashes
-            </Badge>
-          ) : null}
+    <div className="flex min-h-svh flex-col bg-muted/30">
+      <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
+        <div className="mx-auto flex h-14 max-w-5xl items-center justify-between gap-3 px-6">
+          <div className="flex items-center gap-2">
+            <span className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground [&_svg]:size-4">
+              <ShieldCheckIcon />
+            </span>
+            <div className="flex flex-col">
+              <p className="font-heading text-sm leading-none font-medium">
+                Defender
+              </p>
+              <p className="text-xs text-muted-foreground">Virus scanner</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <ScannerStatus
+              loading={health.isLoading || ready.isLoading}
+              healthy={healthy}
+              ready={scannerReady}
+              hashes={readyParsed?.fileHashes}
+            />
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 
-      {upstreamError ? (
-        <Alert variant="destructive">
-          <AlertTitle>Defender is unreachable</AlertTitle>
-          <AlertDescription>
-            {upstreamError}. Start the stack with{" "}
-            <code className="font-mono">docker compose up --build</code> or
-            point <code className="font-mono">DEFENDER_URL</code> at a running
-            scanner.
-          </AlertDescription>
-        </Alert>
-      ) : null}
-
-      {infoParsed ? (
-        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          <StatCard
-            label="File hashes"
-            value={formatCount(infoParsed.signatures.fileHash)}
-          />
-          <StatCard
-            label="PE section hashes"
-            value={formatCount(infoParsed.signatures.sectionHash)}
-          />
-          <StatCard
-            label="Body signatures"
-            value={formatCount(infoParsed.signatures.body)}
-          />
-          <StatCard
-            label="Logical signatures"
-            value={formatCount(infoParsed.signatures.logical)}
-          />
+      <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-8 px-6 py-8">
+        <section className="flex max-w-2xl flex-col gap-2">
+          <h1 className="font-heading text-2xl font-medium tracking-tight">
+            Scan a file or hash
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Check files against the official ClamAV databases. Upload something
+            to get a clear verdict, or look up hashes if you already have
+            fingerprints.
+          </p>
         </section>
-      ) : null}
 
-      {infoParsed?.databases.length ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Loaded databases</CardTitle>
-            <CardDescription>
-              Engine loaded {formatUnix(infoParsed.loadedAtUnix)}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            {infoParsed.databases.map((db) => (
-              <div
-                key={`${db.name}-${db.version}`}
-                className="flex flex-col gap-1"
-              >
-                <div className="flex flex-wrap items-center gap-2">
-                  <p className="font-medium">{db.name}.cvd</p>
+        {upstreamError ? (
+          <Alert variant="destructive">
+            <AlertTitle>Scanner is offline</AlertTitle>
+            <AlertDescription>
+              Defender is not reachable. Start it with{" "}
+              <code className="font-mono">docker compose up --build</code>, or
+              set <code className="font-mono">DEFENDER_URL</code> to a running
+              scanner. {upstreamError}
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
+        {infoParsed ? (
+          <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <StatCard
+              label="File hashes"
+              value={formatCount(infoParsed.signatures.fileHash)}
+              hint="Fingerprints of entire files (MD5, SHA-1, SHA-256)."
+            />
+            <StatCard
+              label="Windows sections"
+              value={formatCount(infoParsed.signatures.sectionHash)}
+              hint="Hashes of sections inside Windows executables (PE files)."
+            />
+            <StatCard
+              label="Byte patterns"
+              value={formatCount(infoParsed.signatures.body)}
+              hint="Content signatures that match sequences of bytes inside a file."
+            />
+            <StatCard
+              label="Logical rules"
+              value={formatCount(infoParsed.signatures.logical)}
+              hint="Multi-condition signatures that combine several matches."
+            />
+          </section>
+        ) : null}
+
+        {infoParsed?.databases.length ? (
+          <Card>
+            <CardHeader>
+              <CardTitle>Signature databases</CardTitle>
+              <CardDescription>
+                Official ClamAV sets currently loaded into the scanner. Last
+                loaded {formatUnix(infoParsed.loadedAtUnix)}.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-3">
+              {infoParsed.databases.map((db) => (
+                <div
+                  key={`${db.name}-${db.version}`}
+                  className="flex flex-wrap items-center gap-2"
+                >
+                  <p className="font-medium">{databaseFileName(db.name)}</p>
                   <Badge variant="outline">v{db.version}</Badge>
                   <Badge variant="secondary">
                     {formatCount(db.headerSignatures)} signatures
                   </Badge>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  {db.builder} · {db.time} · MD5 {db.md5}
-                </p>
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-      ) : null}
+              ))}
+            </CardContent>
+            <CardFooter className="flex-col items-stretch">
+              <Accordion className="w-full">
+                <AccordionItem value="db-details" className="border-none">
+                  <AccordionTrigger>Database details</AccordionTrigger>
+                  <AccordionContent>
+                    <div className="flex flex-col gap-3">
+                      {infoParsed.databases.map((db) => (
+                        <div
+                          key={`${db.name}-${db.version}-detail`}
+                          className="flex flex-col gap-1"
+                        >
+                          <p className="font-medium">
+                            {databaseFileName(db.name)}
+                          </p>
+                          <p className="font-mono text-xs break-all text-muted-foreground">
+                            {db.builder} · {db.time} · MD5 {db.md5}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  </AccordionContent>
+                </AccordionItem>
+              </Accordion>
+            </CardFooter>
+          </Card>
+        ) : null}
 
-      <Tabs defaultValue="file">
-        <TabsList>
-          <TabsTrigger value="file">
-            <FileScanIcon data-icon="inline-start" />
-            Scan file
-          </TabsTrigger>
-          <TabsTrigger value="hash">
-            <HashIcon data-icon="inline-start" />
-            Hash lookup
-          </TabsTrigger>
-          <TabsTrigger value="batch">
-            <ListIcon data-icon="inline-start" />
-            Batch hashes
-          </TabsTrigger>
-          <TabsTrigger value="docs">Docs</TabsTrigger>
-        </TabsList>
-        <TabsContent value="file">
-          <ScanFilePanel />
-        </TabsContent>
-        <TabsContent value="hash">
-          <HashPanel />
-        </TabsContent>
-        <TabsContent value="batch">
-          <BatchPanel />
-        </TabsContent>
-        <TabsContent value="docs">
-          <DocsPanel />
-        </TabsContent>
-      </Tabs>
-    </main>
+        <Tabs defaultValue="file">
+          <TabsList variant="line" className="h-auto w-full justify-start">
+            <TabsTrigger value="file">
+              <FileScanIcon data-icon="inline-start" />
+              File
+            </TabsTrigger>
+            <TabsTrigger value="hash">
+              <HashIcon data-icon="inline-start" />
+              Hash
+            </TabsTrigger>
+            <TabsTrigger value="batch">
+              <ListIcon data-icon="inline-start" />
+              Batch
+            </TabsTrigger>
+            <TabsTrigger value="api">API</TabsTrigger>
+          </TabsList>
+          <TabsContent value="file">
+            <ScanFilePanel />
+          </TabsContent>
+          <TabsContent value="hash">
+            <HashPanel />
+          </TabsContent>
+          <TabsContent value="batch">
+            <BatchPanel />
+          </TabsContent>
+          <TabsContent value="api">
+            <ApiPanel />
+          </TabsContent>
+        </Tabs>
+      </main>
+    </div>
   )
 }
 
-function StatusBadge({
-  label,
-  ok,
+function Hint({ text }: { text: string }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="More information"
+          />
+        }
+      >
+        <CircleHelpIcon />
+      </TooltipTrigger>
+      <TooltipContent>{text}</TooltipContent>
+    </Tooltip>
+  )
+}
+
+function ScannerStatus({
   loading,
+  healthy,
+  ready,
+  hashes,
 }: {
-  label: string
-  ok: boolean
   loading: boolean
+  healthy: boolean
+  ready: boolean
+  hashes?: number
 }) {
   if (loading) {
     return (
       <Badge variant="outline">
         <Spinner />
-        {label}
+        Connecting
+      </Badge>
+    )
+  }
+  if (!healthy) {
+    return <Badge variant="destructive">Offline</Badge>
+  }
+  if (!ready) {
+    return (
+      <Badge variant="outline">
+        <Spinner />
+        Loading signatures
       </Badge>
     )
   }
   return (
-    <Badge variant={ok ? "secondary" : "destructive"}>
-      {label}: {ok ? "ok" : "down"}
+    <Badge variant="secondary">
+      Ready
+      {typeof hashes === "number" ? ` · ${formatCount(hashes)} hashes` : ""}
     </Badge>
   )
 }
 
-function StatCard({ label, value }: { label: string; value: string }) {
+function StatCard({
+  label,
+  value,
+  hint,
+}: {
+  label: string
+  value: string
+  hint: string
+}) {
   return (
     <Card size="sm">
       <CardHeader>
-        <CardDescription>{label}</CardDescription>
+        <CardDescription className="flex items-center gap-1">
+          {label}
+          <Hint text={hint} />
+        </CardDescription>
         <CardTitle>{value}</CardTitle>
       </CardHeader>
     </Card>
@@ -303,11 +398,14 @@ function ScanFilePanel() {
     <div className="flex flex-col gap-4 pt-4">
       <Card>
         <CardHeader>
-          <CardTitle>POST /scan</CardTitle>
+          <CardTitle>Scan a file</CardTitle>
           <CardDescription>
-            Stream a file as raw bytes or multipart form-data. Defender hashes
-            the body incrementally and returns a parsed verdict.
+            Upload a file to check it for known malware. Defender streams the
+            bytes and never stores the upload.
           </CardDescription>
+          <CardAction>
+            <Badge variant="outline">POST /scan</Badge>
+          </CardAction>
         </CardHeader>
         <CardContent>
           <form
@@ -323,32 +421,62 @@ function ScanFilePanel() {
           >
             <FieldGroup>
               <Field>
-                <FieldLabel>Body format</FieldLabel>
-                <ToggleGroup
-                  value={[mode]}
-                  onValueChange={(next) => {
-                    const value = next[0]
-                    if (value === "raw" || value === "multipart") setMode(value)
+                <FieldLabel htmlFor="scan-file">File</FieldLabel>
+                <div
+                  className="flex flex-col gap-3 rounded-xl border border-dashed p-4"
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => {
+                    event.preventDefault()
+                    const next = event.dataTransfer.files[0]
+                    if (next) setFile(next)
                   }}
                 >
-                  <ToggleGroupItem value="raw">Raw bytes</ToggleGroupItem>
-                  <ToggleGroupItem value="multipart">Multipart</ToggleGroupItem>
-                </ToggleGroup>
-                <FieldDescription>
-                  Raw uses{" "}
-                  <code className="font-mono">application/octet-stream</code>.
-                  Multipart sends a <code className="font-mono">file</code>{" "}
-                  field.
-                </FieldDescription>
+                  <Input
+                    id="scan-file"
+                    type="file"
+                    onChange={(event) =>
+                      setFile(event.target.files?.[0] ?? null)
+                    }
+                  />
+                  <FieldDescription>
+                    {file
+                      ? `${file.name} · ${formatBytes(file.size)}`
+                      : "Or drop a file here."}
+                  </FieldDescription>
+                </div>
               </Field>
-              <Field>
-                <FieldLabel htmlFor="scan-file">File</FieldLabel>
-                <Input
-                  id="scan-file"
-                  type="file"
-                  onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-                />
-              </Field>
+              <Accordion>
+                <AccordionItem value="advanced">
+                  <AccordionTrigger>Advanced</AccordionTrigger>
+                  <AccordionContent>
+                    <Field>
+                      <FieldLabel>How the file is sent</FieldLabel>
+                      <ToggleGroup
+                        value={[mode]}
+                        onValueChange={(next) => {
+                          const value = next[0]
+                          if (value === "raw" || value === "multipart") {
+                            setMode(value)
+                          }
+                        }}
+                      >
+                        <ToggleGroupItem value="raw">Raw bytes</ToggleGroupItem>
+                        <ToggleGroupItem value="multipart">
+                          Multipart
+                        </ToggleGroupItem>
+                      </ToggleGroup>
+                      <FieldDescription>
+                        Raw uses{" "}
+                        <code className="font-mono">
+                          application/octet-stream
+                        </code>
+                        . Multipart sends a{" "}
+                        <code className="font-mono">file</code> field.
+                      </FieldDescription>
+                    </Field>
+                  </AccordionContent>
+                </AccordionItem>
+              </Accordion>
             </FieldGroup>
             <div className="flex flex-wrap gap-2">
               <Button type="submit" disabled={scan.isPending}>
@@ -371,8 +499,7 @@ function ScanFilePanel() {
                   scan.mutate({ file: eicar, mode })
                 }}
               >
-                <BugIcon data-icon="inline-start" />
-                Scan EICAR
+                Try a safe test
               </Button>
             </div>
           </form>
@@ -380,7 +507,7 @@ function ScanFilePanel() {
       </Card>
       <ResultArea
         emptyTitle="No scan yet"
-        emptyDescription="Upload a file or scan the EICAR test string. The parsed payload will appear here."
+        emptyDescription="Upload a file, or try the safe EICAR test. It is harmless text that should always come back as infected."
         call={call}
         parsedOk={parsed?.ok ?? false}
         error={parsed?.error?.error}
@@ -388,15 +515,14 @@ function ScanFilePanel() {
         {parsed?.payload && call ? (
           <ScanPayloadCard call={call} payload={parsed.payload} />
         ) : null}
-        {call ? <RawJsonCard value={call.json} /> : null}
       </ResultArea>
     </div>
   )
 }
 
 function HashPanel() {
-  const [digest, setDigest] = useState(EICAR_MD5)
-  const [size, setSize] = useState("68")
+  const [digest, setDigest] = useState("")
+  const [size, setSize] = useState("")
   const [call, setCall] = useState<ApiCall | null>(null)
   const algo = hashAlgorithm(digest)
 
@@ -435,11 +561,14 @@ function HashPanel() {
     <div className="flex flex-col gap-4 pt-4">
       <Card>
         <CardHeader>
-          <CardTitle>POST /scan/hash</CardTitle>
+          <CardTitle>Look up a hash</CardTitle>
           <CardDescription>
-            Look up a single MD5, SHA-1, or SHA-256 digest. Size is optional and
-            used when the signature is size-specific.
+            Check an MD5, SHA-1, or SHA-256 fingerprint without uploading the
+            file.
           </CardDescription>
+          <CardAction>
+            <Badge variant="outline">POST /scan/hash</Badge>
+          </CardAction>
         </CardHeader>
         <CardContent>
           <form
@@ -450,29 +579,49 @@ function HashPanel() {
             }}
           >
             <FieldGroup>
-              <Field data-invalid={algo === "unknown" || undefined}>
+              <Field
+                data-invalid={
+                  (digest !== "" && algo === "unknown") || undefined
+                }
+              >
                 <FieldLabel htmlFor="digest">Hash</FieldLabel>
                 <Input
                   id="digest"
-                  aria-invalid={algo === "unknown"}
+                  aria-invalid={digest !== "" && algo === "unknown"}
                   value={digest}
                   onChange={(event) => setDigest(event.target.value)}
-                  placeholder="MD5, SHA-1, or SHA-256 hex"
+                  placeholder="Paste an MD5, SHA-1, or SHA-256 hex digest"
                 />
                 <FieldDescription>
-                  Detected algorithm:{" "}
-                  {algo === "unknown" ? "unknown length" : algo.toUpperCase()}
+                  {digest === ""
+                    ? "32, 40, or 64 hexadecimal characters."
+                    : algo === "unknown"
+                      ? "This does not look like MD5, SHA-1, or SHA-256."
+                      : `Detected ${algo.toUpperCase()}.`}
                 </FieldDescription>
               </Field>
-              <Field>
-                <FieldLabel htmlFor="hash-size">Size (optional)</FieldLabel>
-                <Input
-                  id="hash-size"
-                  inputMode="numeric"
-                  value={size}
-                  onChange={(event) => setSize(event.target.value)}
-                />
-              </Field>
+              <Accordion>
+                <AccordionItem value="advanced">
+                  <AccordionTrigger>Advanced</AccordionTrigger>
+                  <AccordionContent>
+                    <Field>
+                      <FieldLabel htmlFor="hash-size">
+                        File size (optional)
+                      </FieldLabel>
+                      <Input
+                        id="hash-size"
+                        inputMode="numeric"
+                        value={size}
+                        onChange={(event) => setSize(event.target.value)}
+                        placeholder="Bytes, if the signature is size-specific"
+                      />
+                      <FieldDescription>
+                        Some signatures only match a hash at a given size.
+                      </FieldDescription>
+                    </Field>
+                  </AccordionContent>
+                </AccordionItem>
+              </Accordion>
             </FieldGroup>
             <div className="flex flex-wrap gap-2">
               <Button
@@ -492,9 +641,10 @@ function HashPanel() {
                 onClick={() => {
                   setDigest(EICAR_MD5)
                   setSize("68")
+                  toast.message("Filled the safe EICAR MD5")
                 }}
               >
-                Use EICAR MD5
+                Use safe test hash
               </Button>
             </div>
           </form>
@@ -502,7 +652,7 @@ function HashPanel() {
       </Card>
       <ResultArea
         emptyTitle="No lookup yet"
-        emptyDescription="Paste a digest or use the EICAR MD5 to see a parsed hash verdict."
+        emptyDescription="Paste a digest, or use the safe EICAR test hash to confirm lookups are working."
         call={call}
         parsedOk={parsed?.ok ?? false}
         error={parsed?.error?.error}
@@ -510,16 +660,13 @@ function HashPanel() {
         {parsed?.payload && call ? (
           <ScanPayloadCard call={call} payload={parsed.payload} />
         ) : null}
-        {call ? <RawJsonCard value={call.json} /> : null}
       </ResultArea>
     </div>
   )
 }
 
 function BatchPanel() {
-  const [lines, setLines] = useState(
-    `${EICAR_MD5}\n00000000000000000000000000000000\n`
-  )
+  const [lines, setLines] = useState("")
   const [call, setCall] = useState<ApiCall | null>(null)
 
   const lookup = useMutation({
@@ -547,14 +694,14 @@ function BatchPanel() {
     <div className="flex flex-col gap-4 pt-4">
       <Card>
         <CardHeader>
-          <CardTitle>POST /scan/hashes</CardTitle>
+          <CardTitle>Look up many hashes</CardTitle>
           <CardDescription>
-            One digest per line, optional{" "}
-            <code className="font-mono">algo:hex</code>, or NDJSON objects with{" "}
-            <code className="font-mono">md5</code>/
-            <code className="font-mono">sha1</code>/
-            <code className="font-mono">sha256</code>.
+            Paste one digest per line. Useful for threat intel, CI, or comparing
+            a list of known files.
           </CardDescription>
+          <CardAction>
+            <Badge variant="outline">POST /scan/hashes</Badge>
+          </CardAction>
         </CardHeader>
         <CardContent>
           <form
@@ -573,51 +720,73 @@ function BatchPanel() {
                   className="font-mono"
                   value={lines}
                   onChange={(event) => setLines(event.target.value)}
+                  placeholder={`${EICAR_MD5}\n00000000000000000000000000000000`}
                 />
+                <FieldDescription>
+                  One hex digest per line. Experts can also send{" "}
+                  <code className="font-mono">algo:hex</code> or NDJSON with{" "}
+                  <code className="font-mono">md5</code>/
+                  <code className="font-mono">sha1</code>/
+                  <code className="font-mono">sha256</code>.
+                </FieldDescription>
               </Field>
             </FieldGroup>
-            <Button type="submit" disabled={lookup.isPending}>
-              {lookup.isPending ? (
-                <Spinner />
-              ) : (
-                <ListIcon data-icon="inline-start" />
-              )}
-              Scan hashes
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="submit"
+                disabled={lookup.isPending || !lines.trim()}
+              >
+                {lookup.isPending ? (
+                  <Spinner />
+                ) : (
+                  <ListIcon data-icon="inline-start" />
+                )}
+                Look up hashes
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() =>
+                  setLines(`${EICAR_MD5}\n00000000000000000000000000000000\n`)
+                }
+              >
+                Load example
+              </Button>
+            </div>
           </form>
         </CardContent>
       </Card>
       <ResultArea
         emptyTitle="No batch yet"
-        emptyDescription="Submit one digest per line. Infected, clean, and error rows are parsed into a table."
+        emptyDescription="Submit one digest per line. Results land in a table of clean, infected, and error rows."
         call={call}
         parsedOk={Boolean(items)}
         error={call && !call.ok ? `HTTP ${call.status}` : undefined}
       >
         {items && call ? <HashBatchCard call={call} items={items} /> : null}
-        {call ? <RawJsonCard value={call.json} /> : null}
       </ResultArea>
     </div>
   )
 }
 
-function DocsPanel() {
+function ApiPanel() {
   return (
     <div className="flex flex-col gap-4 pt-4">
       <Card>
         <CardHeader>
           <CardTitle>HTTP API</CardTitle>
           <CardDescription>
-            The playground calls same-origin{" "}
-            <code className="font-mono">/api/*</code> routes, which proxy to
-            defender (<code className="font-mono">DEFENDER_URL</code>, default{" "}
+            This UI calls same-origin <code className="font-mono">/api/*</code>{" "}
+            routes, which proxy to Defender (
+            <code className="font-mono">DEFENDER_URL</code>, default{" "}
             <code className="font-mono">http://127.0.0.1:8080</code>).
           </CardDescription>
         </CardHeader>
-        <CardContent className="flex flex-col gap-4 text-sm">
+        <CardContent className="flex flex-col gap-4">
           <Endpoint
             method="GET"
             path="/health"
+            purpose="Is the process up?"
             body="—"
             response='{ "status": "ok" }'
           />
@@ -625,6 +794,7 @@ function DocsPanel() {
           <Endpoint
             method="GET"
             path="/ready"
+            purpose="Are signatures loaded?"
             body="—"
             response='{ "ready": true, "file_hashes": 0, "body_sigs": 0 }'
           />
@@ -632,6 +802,7 @@ function DocsPanel() {
           <Endpoint
             method="GET"
             path="/info"
+            purpose="What databases and signature counts are loaded?"
             body="—"
             response="databases[], signatures, loaded_at_unix"
           />
@@ -639,6 +810,7 @@ function DocsPanel() {
           <Endpoint
             method="POST"
             path="/scan"
+            purpose="Scan a file"
             body="raw bytes or multipart file"
             response='{ "result": "clean"|"infected", "signature"?, "size", "md5", "sha1", "sha256", "duration_us" }'
           />
@@ -646,13 +818,15 @@ function DocsPanel() {
           <Endpoint
             method="POST"
             path="/scan/hash"
+            purpose="Look up one hash"
             body='{ "md5"|"sha1"|"sha256"|"hash", "size"? }'
-            response="Same scan payload. Empty hash fields are omitted for unused algorithms."
+            response="Same scan payload. Unused hash fields are omitted."
           />
           <Separator />
           <Endpoint
             method="POST"
             path="/scan/hashes"
+            purpose="Look up many hashes"
             body="one digest per line, algo:hex, or NDJSON"
             response='[{ "result", "hash", "signature"? }]'
           />
@@ -660,10 +834,11 @@ function DocsPanel() {
       </Card>
       <Card>
         <CardHeader>
-          <CardTitle>EICAR</CardTitle>
+          <CardTitle>Safe test sample</CardTitle>
           <CardDescription>
-            The EICAR test file is harmless text that every ClamAV database
-            should detect. It is not malware.
+            EICAR is a standard harmless string. Every stock ClamAV database
+            should flag it as infected. Use it to confirm Defender is working —
+            it is not malware.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-2">
@@ -678,19 +853,23 @@ function DocsPanel() {
 function Endpoint({
   method,
   path,
+  purpose,
   body,
   response,
 }: {
   method: string
   path: string
+  purpose: string
   body: string
   response: string
 }) {
   return (
     <div className="flex flex-col gap-1">
-      <p className="font-mono text-sm">
-        <Badge variant="outline">{method}</Badge> {path}
-      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge variant="outline">{method}</Badge>
+        <p className="font-mono text-sm">{path}</p>
+      </div>
+      <p>{purpose}</p>
       <p className="text-muted-foreground">Request: {body}</p>
       <p className="text-muted-foreground">Response: {response}</p>
     </div>
@@ -714,7 +893,7 @@ function ResultArea({
 }) {
   if (!call) {
     return (
-      <Empty className="border">
+      <Empty className="border bg-card">
         <EmptyHeader>
           <EmptyMedia variant="icon">
             <ShieldCheckIcon />
@@ -736,14 +915,27 @@ function ResultArea({
       ) : null}
       {!parsedOk && !error ? (
         <Alert>
-          <AlertTitle>Unparsed payload</AlertTitle>
+          <AlertTitle>Unexpected response</AlertTitle>
           <AlertDescription>
-            HTTP {call.status}. The body did not match the expected defender
+            HTTP {call.status}. The body did not match the expected Defender
             JSON shape.
           </AlertDescription>
         </Alert>
       ) : null}
       {children}
+      {!parsedOk ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Response</CardTitle>
+            <CardDescription>
+              Raw scanner output for debugging this request.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <TechnicalDetails call={call} />
+          </CardContent>
+        </Card>
+      ) : null}
     </div>
   )
 }
