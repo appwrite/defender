@@ -35,13 +35,6 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import {
-  Empty,
-  EmptyDescription,
-  EmptyHeader,
-  EmptyMedia,
-  EmptyTitle,
-} from "@/components/ui/empty"
-import {
   Field,
   FieldDescription,
   FieldGroup,
@@ -49,6 +42,7 @@ import {
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
@@ -58,7 +52,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
-import { callDefender, type ApiCall } from "@/lib/api"
+import { callDefender, fetchScannerSnapshot, type ApiCall } from "@/lib/api"
 import {
   EICAR,
   EICAR_MD5,
@@ -74,7 +68,10 @@ import {
   wrapParsed,
 } from "@/lib/payload"
 
-export const Route = createFileRoute("/")({ component: App })
+export const Route = createFileRoute("/")({
+  loader: fetchScannerSnapshot,
+  component: App,
+})
 
 function databaseFileName(name: string) {
   return /\.(cvd|cld)$/i.test(name) ? name : `${name}.cvd`
@@ -83,20 +80,24 @@ function databaseFileName(name: string) {
 type BodyMode = "raw" | "multipart"
 
 function App() {
+  const initial = Route.useLoaderData()
   const health = useQuery({
     queryKey: ["health"],
     queryFn: () => callDefender("/health"),
     refetchInterval: 5_000,
+    ...(initial.health ? { initialData: initial.health } : {}),
   })
   const ready = useQuery({
     queryKey: ["ready"],
     queryFn: () => callDefender("/ready"),
     refetchInterval: 5_000,
+    ...(initial.ready ? { initialData: initial.ready } : {}),
   })
   const info = useQuery({
     queryKey: ["info"],
     queryFn: () => callDefender("/info"),
     refetchInterval: 15_000,
+    ...(initial.info ? { initialData: initial.info } : {}),
   })
 
   const healthPayload = health.data
@@ -127,18 +128,23 @@ function App() {
             </span>
             <div className="flex flex-col">
               <p className="font-heading text-sm leading-none font-medium">
-                Defender
+                Appwrite Defender
               </p>
               <p className="text-xs text-muted-foreground">Virus scanner</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <ScannerStatus
-              loading={health.isLoading || ready.isLoading}
-              healthy={healthy}
-              ready={scannerReady}
-              hashes={readyParsed?.fileHashes}
-            />
+            <div className="flex h-5 min-w-52 items-center justify-end">
+              <ScannerStatus
+                loading={
+                  (health.isPending && !health.isError) ||
+                  (ready.isPending && !ready.isError)
+                }
+                healthy={healthy}
+                ready={scannerReady}
+                hashes={readyParsed?.fileHashes}
+              />
+            </div>
             <ThemeToggle />
           </div>
         </div>
@@ -169,7 +175,7 @@ function App() {
         ) : null}
 
         {infoParsed ? (
-          <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <section className="grid min-h-[4.75rem] gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <StatCard
               label="File hashes"
               value={formatCount(infoParsed.signatures.fileHash)}
@@ -191,10 +197,17 @@ function App() {
               hint="Multi-condition signatures that combine several matches."
             />
           </section>
-        ) : null}
+        ) : info.isError ? null : (
+          <section className="grid min-h-[4.75rem] gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <StatCardSkeleton />
+            <StatCardSkeleton />
+            <StatCardSkeleton />
+            <StatCardSkeleton />
+          </section>
+        )}
 
         {infoParsed?.databases.length ? (
-          <Card>
+          <Card className="min-h-60">
             <CardHeader>
               <CardTitle>Signature databases</CardTitle>
               <CardDescription>
@@ -241,7 +254,21 @@ function App() {
               </Accordion>
             </CardFooter>
           </Card>
-        ) : null}
+        ) : infoParsed || info.isError ? null : (
+          <Card className="min-h-60">
+            <CardHeader>
+              <Skeleton className="h-5 w-40" />
+              <Skeleton className="h-4 w-full max-w-md" />
+            </CardHeader>
+            <CardContent className="flex flex-col gap-3">
+              <Skeleton className="h-5 w-48" />
+              <Skeleton className="h-5 w-56" />
+            </CardContent>
+            <CardFooter>
+              <Skeleton className="h-5 w-36" />
+            </CardFooter>
+          </Card>
+        )}
 
         <Tabs defaultValue="file">
           <TabsList variant="line" className="h-auto w-full justify-start">
@@ -334,6 +361,17 @@ function ScannerStatus({
   )
 }
 
+function StatCardSkeleton() {
+  return (
+    <Card size="sm" className="h-[4.75rem]">
+      <CardHeader>
+        <Skeleton className="h-4 w-24" />
+        <Skeleton className="h-5 w-20" />
+      </CardHeader>
+    </Card>
+  )
+}
+
 function StatCard({
   label,
   value,
@@ -344,9 +382,9 @@ function StatCard({
   hint: string
 }) {
   return (
-    <Card size="sm">
+    <Card size="sm" className="h-[4.75rem]">
       <CardHeader>
-        <CardDescription className="flex items-center gap-1">
+        <CardDescription className="flex h-6 items-center gap-1">
           {label}
           <Hint text={hint} />
         </CardDescription>
@@ -506,8 +544,6 @@ function ScanFilePanel() {
         </CardContent>
       </Card>
       <ResultArea
-        emptyTitle="No scan yet"
-        emptyDescription="Upload a file, or try the safe EICAR test. It is harmless text that should always come back as infected."
         call={call}
         parsedOk={parsed?.ok ?? false}
         error={parsed?.error?.error}
@@ -651,8 +687,6 @@ function HashPanel() {
         </CardContent>
       </Card>
       <ResultArea
-        emptyTitle="No lookup yet"
-        emptyDescription="Paste a digest, or use the safe EICAR test hash to confirm lookups are working."
         call={call}
         parsedOk={parsed?.ok ?? false}
         error={parsed?.error?.error}
@@ -757,8 +791,6 @@ function BatchPanel() {
         </CardContent>
       </Card>
       <ResultArea
-        emptyTitle="No batch yet"
-        emptyDescription="Submit one digest per line. Results land in a table of clean, infected, and error rows."
         call={call}
         parsedOk={Boolean(items)}
         error={call && !call.ok ? `HTTP ${call.status}` : undefined}
@@ -877,32 +909,18 @@ function Endpoint({
 }
 
 function ResultArea({
-  emptyTitle,
-  emptyDescription,
   call,
   parsedOk,
   error,
   children,
 }: {
-  emptyTitle: string
-  emptyDescription: string
   call: ApiCall | null
   parsedOk: boolean
   error?: string
   children: ReactNode
 }) {
   if (!call) {
-    return (
-      <Empty className="border bg-card">
-        <EmptyHeader>
-          <EmptyMedia variant="icon">
-            <ShieldCheckIcon />
-          </EmptyMedia>
-          <EmptyTitle>{emptyTitle}</EmptyTitle>
-          <EmptyDescription>{emptyDescription}</EmptyDescription>
-        </EmptyHeader>
-      </Empty>
-    )
+    return null
   }
 
   return (

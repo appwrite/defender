@@ -4,6 +4,7 @@ mod pe;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use arc_swap::ArcSwap;
@@ -187,12 +188,14 @@ impl Engine {
 
     pub fn load_dir(dir: impl AsRef<Path>, verify: VerifyMode, load_pua: bool) -> Result<Self> {
         let dir = dir.as_ref();
+        let t0 = Instant::now();
         let mut builder = EngineBuilder::new();
         let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
             .map_err(|e| Error::io(dir, e))?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .collect();
         entries.sort();
+        let mut cvds = 0usize;
         for path in entries {
             let name = path
                 .file_name()
@@ -206,23 +209,56 @@ impl Engine {
                 .to_ascii_lowercase();
             match ext.as_str() {
                 "cvd" | "cld" => {
+                    let t1 = Instant::now();
                     let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
                     let mode = if ext == "cvd" {
                         verify
                     } else {
                         VerifyMode::Integrity
                     };
+                    tracing::info!(
+                        file = %name,
+                        bytes = bytes.len(),
+                        verify = ?mode,
+                        "reading CVD"
+                    );
                     let (header, unpacked) = load_bytes(&bytes, mode)?;
+                    tracing::info!(
+                        file = %name,
+                        version = header.version,
+                        signatures = header.signatures,
+                        flevel = header.flevel,
+                        builder = %header.builder,
+                        built = %header.time,
+                        members = unpacked.files.len(),
+                        elapsed_ms = t1.elapsed().as_millis() as u64,
+                        "verified and unpacked CVD"
+                    );
                     builder.add_cvd(&name, header, &unpacked, load_pua);
+                    cvds += 1;
                 }
-                _ => builder.add_named_file(
-                    &name,
-                    &std::fs::read(&path).unwrap_or_default(),
-                    load_pua,
-                ),
+                _ => {
+                    tracing::debug!(file = %name, "loading signature file");
+                    builder.add_named_file(
+                        &name,
+                        &std::fs::read(&path).unwrap_or_default(),
+                        load_pua,
+                    );
+                }
             }
         }
-        Ok(builder.build())
+        tracing::info!(cvds, "compiling scan engine");
+        let engine = builder.build();
+        tracing::info!(
+            file_hashes = engine.meta.file_hashes,
+            section_hashes = engine.meta.section_hashes,
+            body = engine.meta.body_sigs,
+            logical = engine.meta.logical_sigs,
+            skipped = engine.meta.skipped_sigs,
+            elapsed_ms = t0.elapsed().as_millis() as u64,
+            "scan engine compiled"
+        );
+        Ok(engine)
     }
 
     pub fn from_unpacked(info: CvdInfo, unpacked: &UnpackedDb, load_pua: bool) -> Self {

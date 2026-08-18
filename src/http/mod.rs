@@ -3,15 +3,15 @@
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
 use crate::engine::{Database, IncrementalHashers, ScanVerdict};
@@ -87,8 +87,53 @@ pub fn router(state: AppState) -> Router {
         .route("/scan/hashes", post(scan_hashes))
         .with_state(state)
         .layer(DefaultBodyLimit::max(max.saturating_add(1024 * 1024)))
-        .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)))
+        .layer(middleware::from_fn(access_log))
+}
+
+async fn access_log(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let t0 = Instant::now();
+    let response = next.run(request).await;
+    let status = response.status();
+    let latency_ms = t0.elapsed().as_millis() as u64;
+    let probe = path == "/health" || path == "/ready";
+    let scan = path.starts_with("/scan");
+    if probe || (scan && status.is_success()) {
+        tracing::debug!(
+            %method,
+            path = %path,
+            status = status.as_u16(),
+            latency_ms,
+            "http"
+        );
+    } else if status.is_server_error() {
+        tracing::error!(
+            %method,
+            path = %path,
+            status = status.as_u16(),
+            latency_ms,
+            "http"
+        );
+    } else if status.is_client_error() {
+        tracing::warn!(
+            %method,
+            path = %path,
+            status = status.as_u16(),
+            latency_ms,
+            "http"
+        );
+    } else {
+        tracing::info!(
+            %method,
+            path = %path,
+            status = status.as_u16(),
+            latency_ms,
+            "http"
+        );
+    }
+    response
 }
 
 async fn health() -> impl IntoResponse {
@@ -213,24 +258,41 @@ fn finish_scan(state: &AppState, data: &[u8], hashes: &crate::engine::HashBytes)
     let result = eng.scan_prehashed(data, hashes);
     let duration_us = t0.elapsed().as_micros() as u64;
     match result.verdict {
-        ScanVerdict::Clean => ScanResponse {
-            result: "clean",
-            signature: None,
-            size: result.hashes.size,
-            md5: result.hashes.md5,
-            sha1: result.hashes.sha1,
-            sha256: result.hashes.sha256,
-            duration_us,
-        },
-        ScanVerdict::Infected { signature } => ScanResponse {
-            result: "infected",
-            signature: Some(signature),
-            size: result.hashes.size,
-            md5: result.hashes.md5,
-            sha1: result.hashes.sha1,
-            sha256: result.hashes.sha256,
-            duration_us,
-        },
+        ScanVerdict::Clean => {
+            tracing::debug!(
+                size = result.hashes.size,
+                duration_us,
+                md5 = %result.hashes.md5,
+                "scan clean"
+            );
+            ScanResponse {
+                result: "clean",
+                signature: None,
+                size: result.hashes.size,
+                md5: result.hashes.md5,
+                sha1: result.hashes.sha1,
+                sha256: result.hashes.sha256,
+                duration_us,
+            }
+        }
+        ScanVerdict::Infected { signature } => {
+            tracing::info!(
+                size = result.hashes.size,
+                duration_us,
+                signature = %signature,
+                md5 = %result.hashes.md5,
+                "scan infected"
+            );
+            ScanResponse {
+                result: "infected",
+                signature: Some(signature),
+                size: result.hashes.size,
+                md5: result.hashes.md5,
+                sha1: result.hashes.sha1,
+                sha256: result.hashes.sha256,
+                duration_us,
+            }
+        }
     }
 }
 
@@ -247,26 +309,36 @@ async fn scan_hash(State(state): State<AppState>, Json(req): Json<HashRequest>) 
         _ => (String::new(), String::new(), digest.clone()),
     };
     match eng.lookup_hex(&digest, req.size) {
-        Ok(Some(signature)) => Json(ScanResponse {
-            result: "infected",
-            signature: Some(signature),
-            size: req.size.unwrap_or(0),
-            md5,
-            sha1,
-            sha256,
-            duration_us: t0.elapsed().as_micros() as u64,
-        })
-        .into_response(),
-        Ok(None) => Json(ScanResponse {
-            result: "clean",
-            signature: None,
-            size: req.size.unwrap_or(0),
-            md5,
-            sha1,
-            sha256,
-            duration_us: t0.elapsed().as_micros() as u64,
-        })
-        .into_response(),
+        Ok(Some(signature)) => {
+            tracing::info!(
+                signature = %signature,
+                size = req.size.unwrap_or(0),
+                "hash lookup infected"
+            );
+            Json(ScanResponse {
+                result: "infected",
+                signature: Some(signature),
+                size: req.size.unwrap_or(0),
+                md5,
+                sha1,
+                sha256,
+                duration_us: t0.elapsed().as_micros() as u64,
+            })
+            .into_response()
+        }
+        Ok(None) => {
+            tracing::debug!(size = req.size.unwrap_or(0), "hash lookup clean");
+            Json(ScanResponse {
+                result: "clean",
+                signature: None,
+                size: req.size.unwrap_or(0),
+                md5,
+                sha1,
+                sha256,
+                duration_us: t0.elapsed().as_micros() as u64,
+            })
+            .into_response()
+        }
         Err(e) => error_response(e),
     }
 }
@@ -323,6 +395,13 @@ async fn scan_hashes(State(state): State<AppState>, body: Body) -> Response {
             Err(e) => out.push(serde_json::json!({"error": e.to_string(), "hash": digest})),
         }
     }
+    let infected = out.iter().filter(|v| v["result"] == "infected").count();
+    let errors = out.iter().filter(|v| v.get("error").is_some()).count();
+    if infected > 0 || errors > 0 {
+        tracing::info!(total = out.len(), infected, errors, "hash batch lookup");
+    } else {
+        tracing::debug!(total = out.len(), "hash batch lookup");
+    }
     Json(out).into_response()
 }
 
@@ -332,6 +411,11 @@ fn error_response(e: Error) -> Response {
         Error::InvalidHash(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+    if code.is_server_error() {
+        tracing::error!(status = code.as_u16(), error = %e, "request failed");
+    } else {
+        tracing::warn!(status = code.as_u16(), error = %e, "request rejected");
+    }
     (code, Json(serde_json::json!({"error": msg}))).into_response()
 }
 
@@ -339,16 +423,35 @@ pub async fn serve(cfg: Config, db: Database) -> anyhow::Result<()> {
     let addr = cfg.listen.clone();
     let app = router(AppState { db, cfg });
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(%addr, "defender listening");
+    let bound = listener.local_addr()?;
+    tracing::info!(listen = %addr, %bound, "listening for HTTP requests");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    tracing::info!("http server stopped");
     Ok(())
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal received");
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!(signal = "SIGINT", "shutdown signal received");
+    };
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = sigterm.recv() => {
+                tracing::info!(signal = "SIGTERM", "shutdown signal received");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+    }
 }
 
 #[cfg(test)]
