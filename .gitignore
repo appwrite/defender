@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+.idea
+.vscode
+/data
+/db
+*.cvd
+*.cld
+*.profraw
+/coverage
+/tmp
