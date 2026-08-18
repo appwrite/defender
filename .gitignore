@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+.idea
+.vscode
+/data
+/db
+*.cvd
+*.cld
+*.profraw
+/coverage
+/tmp
+playground/node_modules
+playground/.output
+playground/dist
+playground/.tanstack
+playground/.nitro

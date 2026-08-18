@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.git
+.github
+*.md
+.gitignore
+/data
+/playground
+docker-compose.yml
