@@ -83,7 +83,16 @@ Default mirrors:
 
 ## Docker
 
+Published as [`appwrite/defender`](https://hub.docker.com/r/appwrite/defender). Creating a GitHub Release builds `linux/amd64` and `linux/arm64` and pushes semver tags (`x.y.z`, `x.y`, `x`) to Docker Hub.
+
 The image **bakes in the current official CVDs** at build time and still refreshes them at runtime.
+
+```bash
+docker pull appwrite/defender
+docker run --rm -p 8080:8080 appwrite/defender
+```
+
+Build locally:
 
 ```bash
 docker build -t defender .
@@ -120,8 +129,10 @@ Loaded into the scanner (main + daily, PUA off): ~540k file hashes, ~102k body s
 
 ## Development
 
+Pull requests and pushes to `main` run `cargo test --locked` and a multi-arch Docker build (without pushing). Official CVDs are not required for tests.
+
 ```bash
-cargo test
+cargo test --locked
 cargo bench              # engine + HTTP e2e
 cargo bench --bench http # TCP loopback only
 cargo run
