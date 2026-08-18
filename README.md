@@ -1,6 +1,6 @@
 # Appwrite Defender
 
-![Appwrite Defender](docs/screenshot.png)
+![Appwrite Defender](docs/screenshot.png?x=1)
 
 Appwrite Defender is a high-performance Rust HTTP virus scanner that **parses ClamAV public databases** (CVD/CLD) natively — no `libclamav`, no `clamd`.
 
