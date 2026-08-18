@@ -241,14 +241,19 @@ async fn scan_hash(State(state): State<AppState>, Json(req): Json<HashRequest>) 
         return error_response(Error::InvalidHash("missing hash field".into()));
     };
     let eng = state.db.current();
+    let (md5, sha1, sha256) = match digest.len() {
+        32 => (digest.clone(), String::new(), String::new()),
+        40 => (String::new(), digest.clone(), String::new()),
+        _ => (String::new(), String::new(), digest.clone()),
+    };
     match eng.lookup_hex(&digest, req.size) {
         Ok(Some(signature)) => Json(ScanResponse {
             result: "infected",
             signature: Some(signature),
             size: req.size.unwrap_or(0),
-            md5: String::new(),
-            sha1: String::new(),
-            sha256: digest,
+            md5,
+            sha1,
+            sha256,
             duration_us: t0.elapsed().as_micros() as u64,
         })
         .into_response(),
@@ -256,9 +261,9 @@ async fn scan_hash(State(state): State<AppState>, Json(req): Json<HashRequest>) 
             result: "clean",
             signature: None,
             size: req.size.unwrap_or(0),
-            md5: String::new(),
-            sha1: String::new(),
-            sha256: digest,
+            md5,
+            sha1,
+            sha256,
             duration_us: t0.elapsed().as_micros() as u64,
         })
         .into_response(),

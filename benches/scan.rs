@@ -3,7 +3,6 @@ use defender::cvd::unpack::pack_cvd;
 use defender::cvd::VerifyMode;
 use defender::engine::{hash_bytes, Engine, IncrementalHashers, EICAR};
 use md5::{Digest, Md5};
-use sha2::Sha256;
 
 fn built_engine(hash_count: usize, body_count: usize) -> Engine {
     let mut hdb = String::new();
