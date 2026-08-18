@@ -559,7 +559,7 @@ fn detect_kind(data: &[u8]) -> TargetType {
 }
 
 fn target_ok(need: TargetType, have: TargetType) -> bool {
-    need == TargetType::Any || need == have || have == TargetType::Any
+    need == TargetType::Any || need == have
 }
 
 fn offset_ok(off: &OffsetKind, at: usize, len: usize, pe: Option<&PeImage>) -> bool {
@@ -946,6 +946,57 @@ mod tests {
         let eng = Engine::from_cvd_bytes("t", &cvd, VerifyMode::Integrity, false).unwrap();
         // ignored name → clean even though body matches
         assert!(matches!(eng.scan(EICAR).verdict, ScanVerdict::Clean));
+    }
+
+    #[test]
+    fn unknown_files_do_not_match_target_specific_sigs() {
+        assert!(target_ok(TargetType::Any, TargetType::Any));
+        assert!(target_ok(TargetType::Any, TargetType::Pe));
+        assert!(target_ok(TargetType::Pe, TargetType::Pe));
+        assert!(!target_ok(TargetType::Pe, TargetType::Any));
+        assert!(!target_ok(TargetType::Html, TargetType::Any));
+        assert!(!target_ok(TargetType::Ole2, TargetType::Pdf));
+
+        // Target 3 = HTML. Pattern is ASCII "EVIL".
+        let html = "Test.HtmlOnly:3:*:4556494c\n";
+        let pe = "Test.PeOnly:1:*:4556494c\n";
+        let any = "Test.Any:0:*:4556494c\n";
+        let html_eng = Engine::from_cvd_bytes(
+            "t",
+            &pack_cvd(&[("t.ndb", html.as_bytes())], 1, "u").unwrap(),
+            VerifyMode::Integrity,
+            false,
+        )
+        .unwrap();
+        let pe_eng = Engine::from_cvd_bytes(
+            "t",
+            &pack_cvd(&[("t.ndb", pe.as_bytes())], 1, "u").unwrap(),
+            VerifyMode::Integrity,
+            false,
+        )
+        .unwrap();
+        let any_eng = Engine::from_cvd_bytes(
+            "t",
+            &pack_cvd(&[("t.ndb", any.as_bytes())], 1, "u").unwrap(),
+            VerifyMode::Integrity,
+            false,
+        )
+        .unwrap();
+
+        let text = b"this is EVIL text";
+        let mut mz = b"MZ".to_vec();
+        mz.extend_from_slice(b"EVIL");
+
+        assert!(matches!(html_eng.scan(text).verdict, ScanVerdict::Clean));
+        assert!(matches!(pe_eng.scan(text).verdict, ScanVerdict::Clean));
+        assert!(matches!(
+            any_eng.scan(text).verdict,
+            ScanVerdict::Infected { .. }
+        ));
+        assert!(matches!(
+            pe_eng.scan(&mz).verdict,
+            ScanVerdict::Infected { .. }
+        ));
     }
 
     #[test]
