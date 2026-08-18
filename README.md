@@ -105,11 +105,25 @@ docker run --rm -p 8080:8080 defender
 | `DEFENDER_USER_AGENT` | `ClamAV/1.4.2 (defender; rust-http)` |
 | `RUST_LOG` | `info` |
 
+## Virus database sizes
+
+Official ClamAV CVD files as of 18 Aug 2026 (from `database.clamav.net`):
+
+| File | On disk | Unpacked | Header signatures | Notes |
+| --- | ---: | ---: | ---: | --- |
+| `main.cvd` | **84.95 MiB** (89,072,577 B) | 225.39 MiB | 3,287,027 | Base set; largest member `main.mdb` 159 MiB |
+| `daily.cvd` | **22.34 MiB** (23,426,416 B) | 82.14 MiB | 355,605 | Daily deltas; largest member `daily.ldb` 73 MiB |
+| `bytecode.cvd` | **0.27 MiB** (281,702 B) | 1.24 MiB | 80 | Not executed (no bytecode VM) |
+| **Total baked** | **107.56 MiB** | **308.8 MiB** | | Image includes `main` + `daily` |
+
+Loaded into the scanner (main + daily, PUA off): ~540k file hashes, ~102k body signatures, ~307k logical signatures. Resident set with that engine is about **1.4 GiB**.
+
 ## Development
 
 ```bash
 cargo test
-cargo bench
+cargo bench              # engine + HTTP e2e
+cargo bench --bench http # TCP loopback only
 cargo run
 ```
 
@@ -117,7 +131,9 @@ Place CVD files in `DEFENDER_DB_DIR` or let the updater download them on first s
 
 ## Benchmarks
 
-Release mode, 4× x86_64, Criterion (this environment):
+Release mode, 4× x86_64, Criterion (this environment).
+
+### Engine (in-process)
 
 | Benchmark | Time | Throughput |
 | --- | --- | --- |
@@ -129,9 +145,36 @@ Release mode, 4× x86_64, Criterion (this environment):
 | CVD header parse + gzip/tar unpack (tiny) | 6.02 µs | |
 | Scan via `ArcSwap` (hot-reload path) | 542 ns | |
 
-Scan throughput is bounded by the triple hasher; Aho-Corasick / hash-map lookup add negligible cost on the clean path. RSS tests (`tests/memory.rs`) hold memory stable across 20k scans and 200 engine swaps.
+### HTTP e2e (live TCP loopback)
 
-Official `daily.cvd` (RSA-verified, release build): loads in ~9 s (~55k file hashes, ~269k logical signatures) and detects EICAR. The previous engine keeps serving during that compile, then swaps atomically.
+`cargo bench --bench http` binds `127.0.0.1:0`, serves the real Axum router, and uses a keep-alive `reqwest` client.
+
+Synthetic engine (10k hashes + EICAR body sig):
+
+| Endpoint | Time | Throughput |
+| --- | --- | --- |
+| `GET /health` | 36.2 µs | 27.7 k req/s |
+| `GET /info` | 36.4 µs | 27.5 k req/s |
+| `POST /scan` EICAR | 44.8 µs | 22.3 k req/s |
+| `POST /scan/hash` EICAR MD5 | 44.6 µs | 22.4 k req/s |
+| `POST /scan/hashes` (3 lines) | 45.3 µs | 22.1 k req/s |
+| `POST /scan` clean 1 KiB | 47.2 µs | 20.7 MiB/s |
+| `POST /scan` clean 64 KiB | 241 µs | 259 MiB/s |
+| `POST /scan` clean 1 MiB | 3.37 ms | 296 MiB/s |
+| `POST /scan` EICAR ×32 concurrent | 583 µs / batch | **54.9 k req/s** |
+
+Official `daily.cvd` over the same HTTP path:
+
+| Endpoint | Time | Throughput |
+| --- | --- | --- |
+| `POST /scan` EICAR | 44.5 µs | 22.5 k req/s |
+| `POST /scan/hash` EICAR MD5 | 43.6 µs | 22.9 k req/s |
+| `POST /scan` clean 64 KiB | 667 µs | 93.7 MiB/s |
+| `POST /scan` EICAR ×16 concurrent | 296 µs / batch | **54.0 k req/s** |
+
+Tiny requests are loopback/HTTP-latency bound; large bodies are bounded by MD5+SHA1+SHA256. RSS tests (`tests/memory.rs`) stay stable across 20k scans and 200 engine swaps.
+
+## Architecture
 
 ```
 upload bytes ──► incremental MD5/SHA1/SHA256 + buffer

@@ -663,9 +663,9 @@ impl EngineBuilder {
         } else if lower.ends_with(".hsb") || lower.ends_with(".hsu") {
             let _ = self.file_hash.load_text(text, None);
         } else if lower.ends_with(".mdb") || lower.ends_with(".mdu") {
-            let _ = self.section_hash.load_text(text, Some(HashAlgo::Md5));
+            self.section_hash.load_mdb_text(text, Some(HashAlgo::Md5));
         } else if lower.ends_with(".msb") || lower.ends_with(".msu") {
-            let _ = self.section_hash.load_text(text, None);
+            self.section_hash.load_mdb_text(text, None);
         } else if lower.ends_with(".ndb") || lower.ends_with(".ndu") {
             let (sigs, skipped) = load_ndb(text);
             self.skipped += skipped;

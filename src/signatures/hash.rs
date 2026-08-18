@@ -3,8 +3,8 @@
 //! Formats (ClamAV):
 //! * `.hdb`: `MD5:Size:Name[:MinFL[:MaxFL]]`
 //! * `.hsb`: `SHA1|SHA256:Size:Name[:MinFL[:MaxFL]]` (algorithm from hex length)
-//! * `.mdb`: `MD5:SectionSize:Name`
-//! * `.msb`: `SHA1|SHA256:SectionSize:Name`
+//! * `.mdb`: `SectionSize:MD5:Name` (size **first**, unlike `.hdb`)
+//! * `.msb`: `SectionSize:SHA1|SHA256:Name`
 //! * `.fp` / `.sfp`: same layout, used as false-positive allow-lists
 //!
 //! `Size` may be `*` meaning any length.
@@ -31,6 +31,15 @@ pub struct HashSig {
 
 impl HashSig {
     pub fn parse_line(line: &str, force: Option<HashAlgo>) -> Result<Self> {
+        Self::parse_ordered(line, force, false)
+    }
+
+    /// PE section hashes (`.mdb` / `.msb`) put size before the digest.
+    pub fn parse_mdb_line(line: &str, force: Option<HashAlgo>) -> Result<Self> {
+        Self::parse_ordered(line, force, true)
+    }
+
+    fn parse_ordered(line: &str, force: Option<HashAlgo>, size_first: bool) -> Result<Self> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             return Err(Error::Signature {
@@ -39,8 +48,15 @@ impl HashSig {
             });
         }
         let mut parts = line.split(':');
-        let hex = parts.next().ok_or_else(|| sig("missing hash"))?;
-        let size_s = parts.next().ok_or_else(|| sig("missing size"))?;
+        let (hex, size_s) = if size_first {
+            let size_s = parts.next().ok_or_else(|| sig("missing size"))?;
+            let hex = parts.next().ok_or_else(|| sig("missing hash"))?;
+            (hex, size_s)
+        } else {
+            let hex = parts.next().ok_or_else(|| sig("missing hash"))?;
+            let size_s = parts.next().ok_or_else(|| sig("missing size"))?;
+            (hex, size_s)
+        };
         let name = parts.next().ok_or_else(|| sig("missing name"))?;
         // Remaining fields are optional flevel; ignore.
         if name.is_empty() {
@@ -131,6 +147,21 @@ impl HashDb {
                 continue;
             }
             if let Ok(sig) = HashSig::parse_line(line, force) {
+                self.insert(sig);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    pub fn load_mdb_text(&mut self, text: &str, force: Option<HashAlgo>) -> usize {
+        let mut n = 0;
+        for line in text.split('\n') {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Ok(sig) = HashSig::parse_mdb_line(line, force) {
                 self.insert(sig);
                 n += 1;
             }
@@ -233,6 +264,23 @@ mod tests {
         assert_eq!(s.algo, HashAlgo::Md5);
         assert_eq!(s.size, Some(68));
         assert_eq!(s.name, "Eicar-Test-Signature");
+    }
+
+    #[test]
+    fn parse_mdb_size_first() {
+        let s = HashSig::parse_mdb_line(
+            "45056:3ea7d00dedd30bcdf46191358c36ffa4:Eicar-Test-Signature",
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.algo, HashAlgo::Md5);
+        assert_eq!(s.size, Some(45056));
+        assert_eq!(s.name, "Eicar-Test-Signature");
+        assert!(HashSig::parse_line(
+            "45056:3ea7d00dedd30bcdf46191358c36ffa4:Eicar-Test-Signature",
+            None
+        )
+        .is_err());
     }
 
     #[test]

@@ -18,7 +18,7 @@ md-5 = "=0.10.6"
 memchr = "=2.7.4"
 num-bigint = "=0.4.6"
 num-traits = "=0.2.19"
-reqwest = { version = "=0.11.27", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "=0.11.27", default-features = false, features = ["rustls-tls", "stream", "json"] }
 rustc-hash = "=2.1.0"
 serde = { version = "=1.0.217", features = ["derive"] }
 serde_json = "=1.0.137"
@@ -34,13 +34,17 @@ tracing = "=0.1.41"
 tracing-subscriber = { version = "=0.3.19", features = ["env-filter"] }
 
 [dev-dependencies]
-criterion = { version = "=0.5.1", features = ["html_reports"] }
+criterion = { version = "=0.5.1", features = ["html_reports", "async_tokio"] }
 http-body-util = "=0.1.2"
 tempfile = "=3.15.0"
 tower = { version = "=0.5.2", features = ["util"] }
 
 [[bench]]
 name = "scan"
+harness = false
+
+[[bench]]
+name = "http"
 harness = false
 
 [profile.release]
