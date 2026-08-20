@@ -186,6 +186,13 @@ impl HashDb {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.md5.shrink_to_fit();
+        self.sha1.shrink_to_fit();
+        self.sha256.shrink_to_fit();
+        self.names.shrink_to_fit();
+    }
 }
 
 fn lookup<'a, const N: usize>(
@@ -247,6 +254,12 @@ impl FpSet {
     }
     pub fn contains_sha256(&self, d: &[u8; 32]) -> bool {
         self.sha256.contains(d)
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.md5.shrink_to_fit();
+        self.sha1.shrink_to_fit();
+        self.sha256.shrink_to_fit();
     }
 }
 

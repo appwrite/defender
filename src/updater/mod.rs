@@ -1,10 +1,15 @@
 //! Background CVD updater: download, verify, hot-swap with zero downtime.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
+use tokio::io::AsyncWriteExt;
+use tokio_stream::StreamExt;
+
+use crate::alloc;
 use crate::config::Config;
 use crate::cvd::header::{CvdHeader, CVD_HEADER_SIZE};
-use crate::cvd::verify::{verify_cvd_bytes, VerifyMode};
+use crate::cvd::verify::{verify_cvd, VerifyMode};
 use crate::engine::{Database, Engine};
 use crate::error::{Error, Result};
 
@@ -88,7 +93,7 @@ impl Updater {
             "remote CVD header"
         );
         if dest.exists() {
-            if let Ok(local) = CvdHeader::parse(&std::fs::read(&dest).unwrap_or_default()) {
+            if let Ok(local) = CvdHeader::read_file(&dest) {
                 if local.version >= remote.version && local.md5 == remote.md5 {
                     tracing::info!(
                         db = name,
@@ -123,41 +128,7 @@ impl Updater {
             );
         }
 
-        let bytes = self.download(name).await?;
-        tracing::info!(
-            db = name,
-            bytes = bytes.len(),
-            "verifying CVD checksum and digital signature"
-        );
-        let header = CvdHeader::parse(&bytes)?;
-        let mode = if self.cfg.verify_official {
-            VerifyMode::Official
-        } else {
-            VerifyMode::Integrity
-        };
-        verify_cvd_bytes(&bytes, &header, mode)?;
-        if header.version != remote.version && dest.exists() {
-            tracing::debug!(
-                db = name,
-                header = header.version,
-                advertised = remote.version,
-                "version differs between Range header and full file"
-            );
-        }
-
-        let tmp = dest.with_extension("cvd.tmp");
-        std::fs::write(&tmp, &bytes).map_err(|e| Error::io(&tmp, e))?;
-        std::fs::rename(&tmp, &dest).map_err(|e| Error::io(&dest, e))?;
-        tracing::info!(
-            db = name,
-            version = header.version,
-            signatures = header.signatures,
-            builder = %header.builder,
-            built = %header.time,
-            bytes = bytes.len(),
-            path = %dest.display(),
-            "verified and installed CVD"
-        );
+        self.download_to(name, &dest).await?;
         Ok(true)
     }
 
@@ -216,12 +187,12 @@ impl Updater {
         CvdHeader::parse(&bytes)
     }
 
-    async fn download(&self, name: &str) -> Result<Vec<u8>> {
+    async fn download_to(&self, name: &str, dest: &Path) -> Result<()> {
         let mut last_err = None;
         for (i, mirror) in self.cfg.mirrors.iter().enumerate() {
             let url = format!("{mirror}/{name}.cvd");
-            match self.download_url(name, &url).await {
-                Ok(b) => return Ok(b),
+            match self.download_url_to(name, &url, dest).await {
+                Ok(()) => return Ok(()),
                 Err(e) => {
                     let remaining = self.cfg.mirrors.len() - i - 1;
                     if remaining > 0 {
@@ -242,8 +213,9 @@ impl Updater {
         Err(last_err.unwrap_or_else(|| Error::Update("no mirrors".into())))
     }
 
-    async fn download_url(&self, name: &str, url: &str) -> Result<Vec<u8>> {
+    async fn download_url_to(&self, name: &str, url: &str, dest: &Path) -> Result<()> {
         let t0 = Instant::now();
+        let tmp = dest.with_extension("cvd.tmp");
         let resp = self
             .client
             .get(url)
@@ -260,30 +232,71 @@ impl Updater {
             advertised_bytes,
             "downloading CVD"
         );
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::Update(e.to_string()))?;
-        let elapsed_ms = t0.elapsed().as_millis() as u64;
-        let bytes_per_sec = if elapsed_ms > 0 {
-            (bytes.len() as u128 * 1000 / elapsed_ms as u128) as u64
-        } else {
-            0
-        };
-        tracing::info!(
-            db = name,
-            %url,
-            bytes = bytes.len(),
-            elapsed_ms,
-            bytes_per_sec,
-            "download complete"
-        );
-        Ok(bytes.to_vec())
+
+        let result = async {
+            let mut file = tokio::fs::File::create(&tmp)
+                .await
+                .map_err(|e| Error::io(&tmp, e))?;
+            let mut stream = resp.bytes_stream();
+            let mut written = 0u64;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| Error::Update(e.to_string()))?;
+                written += chunk.len() as u64;
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| Error::io(&tmp, e))?;
+            }
+            file.flush().await.map_err(|e| Error::io(&tmp, e))?;
+            drop(file);
+
+            let mode = if self.cfg.verify_official {
+                VerifyMode::Official
+            } else {
+                VerifyMode::Integrity
+            };
+            let tmp_path = tmp.clone();
+            let header = tokio::task::spawn_blocking(move || verify_cvd(&tmp_path, mode))
+                .await
+                .map_err(|e| Error::Update(e.to_string()))??;
+
+            tokio::fs::rename(&tmp, dest)
+                .await
+                .map_err(|e| Error::io(dest, e))?;
+
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
+            let bytes_per_sec = if elapsed_ms > 0 {
+                (written as u128 * 1000 / elapsed_ms as u128) as u64
+            } else {
+                0
+            };
+            tracing::info!(
+                db = name,
+                %url,
+                version = header.version,
+                signatures = header.signatures,
+                builder = %header.builder,
+                built = %header.time,
+                bytes = written,
+                elapsed_ms,
+                bytes_per_sec,
+                path = %dest.display(),
+                "verified and installed CVD"
+            );
+            Ok(())
+        }
+        .await;
+
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        result
     }
 
     async fn reload(&self) -> Result<()> {
+        let rss_before = alloc::rss_bytes();
         tracing::info!(
             dir = %self.cfg.db_dir.display(),
+            rss = rss_before.map(alloc::format_bytes),
             "compiling new scan engine from disk (in-flight scans keep the previous engine)"
         );
         let t0 = Instant::now();
@@ -297,17 +310,31 @@ impl Updater {
         let engine = tokio::task::spawn_blocking(move || Engine::load_dir(&dir, verify, pua))
             .await
             .map_err(|e| Error::Update(e.to_string()))??;
+        let rss_compiled = alloc::rss_bytes();
+        let file_hashes = engine.meta.file_hashes;
+        let section_hashes = engine.meta.section_hashes;
+        let body = engine.meta.body_sigs;
+        let logical = engine.meta.logical_sigs;
+        let skipped = engine.meta.skipped_sigs;
+        let db_count = engine.meta.databases.len();
+        let databases = engine.meta.databases.clone();
+        self.db.swap(engine);
+        alloc::reclaim_unused_pages();
+        let rss_after = alloc::rss_bytes();
         tracing::info!(
-            file_hashes = engine.meta.file_hashes,
-            section_hashes = engine.meta.section_hashes,
-            body = engine.meta.body_sigs,
-            logical = engine.meta.logical_sigs,
-            skipped = engine.meta.skipped_sigs,
-            databases = engine.meta.databases.len(),
+            file_hashes,
+            section_hashes,
+            body,
+            logical,
+            skipped,
+            databases = db_count,
             elapsed_ms = t0.elapsed().as_millis() as u64,
+            rss_before = rss_before.map(alloc::format_bytes),
+            rss_compiled = rss_compiled.map(alloc::format_bytes),
+            rss_after = rss_after.map(alloc::format_bytes),
             "scan engine swapped atomically"
         );
-        for d in &engine.meta.databases {
+        for d in &databases {
             tracing::info!(
                 db = %d.name,
                 version = d.version,
@@ -316,7 +343,6 @@ impl Updater {
                 "active CVD"
             );
         }
-        self.db.swap(engine);
         Ok(())
     }
 }

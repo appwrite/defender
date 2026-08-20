@@ -1,5 +1,6 @@
 //! High-performance streaming virus scanner using ClamAV public databases.
 
+pub mod alloc;
 pub mod config;
 pub mod cvd;
 pub mod engine;

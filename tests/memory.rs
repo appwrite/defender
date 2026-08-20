@@ -71,6 +71,7 @@ fn rss_stable_after_engine_swaps() {
     }
     // Force drop of old engines.
     db.swap(tiny_engine(9999));
+    defender::alloc::reclaim_unused_pages();
     for _ in 0..10 {
         let _ = db.current().scan(EICAR);
     }

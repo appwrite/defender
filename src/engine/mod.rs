@@ -6,14 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind};
 use arc_swap::ArcSwap;
 use md5::{Digest, Md5};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha1::Sha1;
 use sha2::Sha256;
 
-use crate::cvd::{load_bytes, CvdHeader, UnpackedDb, VerifyMode};
+use crate::cvd::{for_each_cvd_member, load_bytes, verify_cvd, CvdHeader, UnpackedDb, VerifyMode};
 use crate::error::{Error, Result};
 use crate::signatures::hash::{FpSet, HashAlgo, HashDb};
 use crate::signatures::ldb::{load_ldb, LogicalSig};
@@ -210,19 +210,19 @@ impl Engine {
             match ext.as_str() {
                 "cvd" | "cld" => {
                     let t1 = Instant::now();
-                    let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
                     let mode = if ext == "cvd" {
                         verify
                     } else {
                         VerifyMode::Integrity
                     };
+                    let file_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     tracing::info!(
                         file = %name,
-                        bytes = bytes.len(),
+                        bytes = file_bytes,
                         verify = ?mode,
                         "reading CVD"
                     );
-                    let (header, unpacked) = load_bytes(&bytes, mode)?;
+                    let header = verify_cvd(&path, mode)?;
                     tracing::info!(
                         file = %name,
                         version = header.version,
@@ -230,25 +230,41 @@ impl Engine {
                         flevel = header.flevel,
                         builder = %header.builder,
                         built = %header.time,
-                        members = unpacked.files.len(),
                         elapsed_ms = t1.elapsed().as_millis() as u64,
-                        "verified and unpacked CVD"
+                        "verified CVD, ingesting members"
                     );
-                    builder.add_cvd(&name, header, &unpacked, load_pua);
+                    builder.add_cvd_header(&name, header);
+                    let mut members = 0usize;
+                    for_each_cvd_member(&path, load_pua, |fname, data| {
+                        builder.add_named_file(fname, data, load_pua);
+                        members += 1;
+                        Ok(())
+                    })?;
+                    tracing::info!(
+                        file = %name,
+                        members,
+                        elapsed_ms = t1.elapsed().as_millis() as u64,
+                        "ingested CVD members"
+                    );
                     cvds += 1;
                 }
                 _ => {
-                    tracing::debug!(file = %name, "loading signature file");
-                    builder.add_named_file(
-                        &name,
-                        &std::fs::read(&path).unwrap_or_default(),
-                        load_pua,
-                    );
+                    if crate::signatures::is_signature_member(&name, load_pua) {
+                        tracing::debug!(file = %name, "loading signature file");
+                        builder.add_named_file(
+                            &name,
+                            &std::fs::read(&path).unwrap_or_default(),
+                            load_pua,
+                        );
+                    } else {
+                        tracing::debug!(file = %name, "skipping non-signature file");
+                    }
                 }
             }
         }
         tracing::info!(cvds, "compiling scan engine");
         let engine = builder.build();
+        crate::alloc::reclaim_unused_pages();
         tracing::info!(
             file_hashes = engine.meta.file_hashes,
             section_hashes = engine.meta.section_hashes,
@@ -665,7 +681,7 @@ impl EngineBuilder {
         }
     }
 
-    fn add_cvd(&mut self, name: &str, header: CvdHeader, unpacked: &UnpackedDb, load_pua: bool) {
+    fn add_cvd_header(&mut self, name: &str, header: CvdHeader) {
         self.databases.push(CvdInfo {
             name: name.to_string(),
             version: header.version,
@@ -675,6 +691,10 @@ impl EngineBuilder {
             time: header.time,
             md5: header.md5,
         });
+    }
+
+    fn add_cvd(&mut self, name: &str, header: CvdHeader, unpacked: &UnpackedDb, load_pua: bool) {
+        self.add_cvd_header(name, header);
         for (fname, data) in &unpacked.files {
             self.add_named_file(fname, data, load_pua);
         }
@@ -736,7 +756,15 @@ impl EngineBuilder {
         }
     }
 
-    fn build(self) -> Engine {
+    fn build(mut self) -> Engine {
+        self.file_hash.shrink_to_fit();
+        self.section_hash.shrink_to_fit();
+        self.fp.shrink_to_fit();
+        self.body.shrink_to_fit();
+        self.logical.shrink_to_fit();
+        self.ignored.shrink_to_fit();
+        self.ignored_prefix.shrink_to_fit();
+
         let mut needles: Vec<Vec<u8>> = Vec::new();
         let mut needle_idx: FxHashMap<Vec<u8>, usize> = FxHashMap::default();
 
@@ -791,12 +819,26 @@ impl EngineBuilder {
         if ac_sub.len() < n {
             ac_sub.resize(n, Vec::new());
         }
+        drop(needle_idx);
+        needles.shrink_to_fit();
+        for v in &mut ac_body {
+            v.shrink_to_fit();
+        }
+        for v in &mut ac_sub {
+            v.shrink_to_fit();
+        }
+        slow_body.shrink_to_fit();
+        slow_logical.shrink_to_fit();
 
         let ac = if needles.is_empty() {
             None
         } else {
+            // ContiguousNFA is the memory-bounded automaton. The default
+            // heuristic may pick a DFA, which can be many times larger and is
+            // the main reason a daily CVD reload doubles RSS.
             AhoCorasickBuilder::new()
                 .match_kind(MatchKind::Standard)
+                .kind(Some(AhoCorasickKind::ContiguousNFA))
                 .ascii_case_insensitive(false)
                 .build(&needles)
                 .ok()

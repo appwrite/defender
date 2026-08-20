@@ -130,3 +130,19 @@ fn load_dir_roundtrip() {
         defender::ScanVerdict::Infected { .. }
     ));
 }
+
+#[test]
+fn load_dir_skips_tmp_and_unknown_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let md5 = hex::encode(Md5::digest(EICAR));
+    let hdb = format!("{md5}:68:Eicar-Test-Signature\n");
+    let cvd = pack_cvd(&[("d.hdb", hdb.as_bytes())], 3, "dir").unwrap();
+    std::fs::write(dir.path().join("daily.cvd"), &cvd).unwrap();
+    std::fs::write(dir.path().join("daily.cvd.tmp"), b"not a cvd").unwrap();
+    std::fs::write(dir.path().join("README.txt"), b"ignore me").unwrap();
+    let eng = Engine::load_dir(dir.path(), VerifyMode::Integrity, false).unwrap();
+    assert!(matches!(
+        eng.scan(EICAR).verdict,
+        defender::ScanVerdict::Infected { .. }
+    ));
+}
