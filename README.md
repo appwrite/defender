@@ -73,10 +73,12 @@ A background task (same process, independent Tokio task):
 1. `Range: bytes=0-511` against configured mirrors to read the remote CVD header
 2. Downloads `main.cvd` / `daily.cvd` when the version/MD5 is newer
 3. Verifies MD5 + RSA
-4. Compiles a **new** `Engine` off the request path
-5. Atomically swaps it with `arc-swap`
+4. Compiles a **new** `Engine` off the request path (streaming CVD members so the gzip body is not held alongside the compiled signatures)
+5. Atomically swaps it with `arc-swap`, then returns unused heap pages to the OS
 
 In-flight scans keep the previous `Arc<Engine>` until they finish. No connection drop, no restart.
+
+A daily `daily.cvd` publish is the usual trigger. RSS will rise while both engines exist, then fall back after the swap (`rss_before` / `rss_compiled` / `rss_after` on the reload log line).
 
 Default mirrors:
 
@@ -162,7 +164,7 @@ Official ClamAV CVD files as of 18 Aug 2026 (from `database.clamav.net`):
 | `bytecode.cvd` | **0.27 MiB** (281,702 B) | 1.24 MiB | 80 | Not executed (no bytecode VM) |
 | **Total baked** | **107.56 MiB** | **308.8 MiB** | | Image includes `main` + `daily` |
 
-Loaded into the scanner (main + daily, PUA off): ~540k file hashes, ~102k body signatures, ~307k logical signatures. Resident set with that engine is about **1.4 GiB**.
+Loaded into the scanner (main + daily, PUA off): ~540k file hashes, ~102k body signatures, ~307k logical signatures. Resident set with that engine is about **1.4 GiB**. The Aho-Corasick prefilter uses a contiguous NFA (not a DFA) so a database reload cannot balloon the automaton. After a hot-swap, jemalloc purges unused dirty pages so RSS does not stay at the two-engine peak.
 
 ## Development
 
@@ -220,7 +222,7 @@ Official `daily.cvd` over the same HTTP path:
 | `POST /scan` clean 64 KiB | 667 µs | 93.7 MiB/s |
 | `POST /scan` EICAR ×16 concurrent | 296 µs / batch | **54.0 k req/s** |
 
-Tiny requests are loopback/HTTP-latency bound; large bodies are bounded by MD5+SHA1+SHA256. RSS tests (`tests/memory.rs`) stay stable across 20k scans and 200 engine swaps.
+Tiny requests are loopback/HTTP-latency bound; large bodies are bounded by MD5+SHA1+SHA256. RSS tests (`tests/memory.rs`) stay stable across 20k scans and 200 engine swaps. Reloading official CVDs briefly overlaps the previous engine; unused pages are returned after the swap.
 
 ## Architecture
 

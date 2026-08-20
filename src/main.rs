@@ -16,6 +16,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+    defender::alloc::init();
 
     let cfg = Config::from_env();
     tracing::info!(

@@ -69,13 +69,52 @@ pub fn verify_cvd_bytes(data: &[u8], header: &CvdHeader, mode: VerifyMode) -> Re
     Err(Error::CvdSignature)
 }
 
-/// Verify a CVD file on disk.
+/// Verify a CVD file on disk without buffering the gzip body.
 pub fn verify_cvd(path: impl AsRef<std::path::Path>, mode: VerifyMode) -> Result<CvdHeader> {
+    use std::io::Read;
+
     let path = path.as_ref();
-    let data = std::fs::read(path).map_err(|e| Error::io(path, e))?;
-    let header = CvdHeader::parse(&data)?;
-    verify_cvd_bytes(&data, &header, mode)?;
-    Ok(header)
+    let mut file = std::fs::File::open(path).map_err(|e| Error::io(path, e))?;
+    let mut hdr = [0u8; CVD_HEADER_SIZE];
+    file.read_exact(&mut hdr).map_err(|e| Error::io(path, e))?;
+    let header = CvdHeader::parse(&hdr)?;
+
+    let mut md5 = Md5::new();
+    let mut sha = Sha256::new();
+    let mut buf = [0u8; 128 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| Error::io(path, e))?;
+        if n == 0 {
+            break;
+        }
+        md5.update(&buf[..n]);
+        if mode == VerifyMode::Official {
+            sha.update(&buf[..n]);
+        }
+    }
+    let digest = hex::encode(md5.finalize());
+    if digest != header.md5 {
+        return Err(Error::CvdChecksum {
+            expected: header.md5.clone(),
+            actual: digest,
+        });
+    }
+    if mode == VerifyMode::Integrity {
+        return Ok(header);
+    }
+    if verify_legacy_md5(&header.md5, &header.dsig) {
+        return Ok(header);
+    }
+    let sha = sha.finalize();
+    if verify_pss(&sha, &header.dsig, CLI_NSTR, CLI_ESTR) {
+        return Ok(header);
+    }
+    for (_name, n, e) in CLAMAV_RSA_KEYS.iter().skip(1) {
+        if verify_pss(&sha, &header.dsig, n, e) {
+            return Ok(header);
+        }
+    }
+    Err(Error::CvdSignature)
 }
 
 pub fn md5_hex(data: &[u8]) -> String {
@@ -295,5 +334,31 @@ mod tests {
         data[..CVD_HEADER_SIZE].copy_from_slice(&header.to_bytes());
         data[CVD_HEADER_SIZE..].copy_from_slice(body);
         assert!(verify_cvd_bytes(&data, &header, VerifyMode::Integrity).is_err());
+    }
+
+    #[test]
+    fn verify_cvd_streams_from_disk() {
+        let body = b"hello-gzip-body";
+        let md5 = md5_hex(body);
+        let mut data = vec![0u8; CVD_HEADER_SIZE + body.len()];
+        let header = CvdHeader {
+            magic: "ClamAV-VDB".into(),
+            time: "now".into(),
+            version: 1,
+            signatures: 0,
+            flevel: 1,
+            md5: md5.clone(),
+            dsig: "placeholder".into(),
+            builder: "test".into(),
+            stime: 0,
+        };
+        data[..CVD_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+        data[CVD_HEADER_SIZE..].copy_from_slice(body);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.cvd");
+        std::fs::write(&path, &data).unwrap();
+        let loaded = verify_cvd(&path, VerifyMode::Integrity).unwrap();
+        assert_eq!(loaded.md5, md5);
+        assert_eq!(loaded.version, 1);
     }
 }

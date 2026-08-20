@@ -1,13 +1,16 @@
 //! Unpack the gzip+tar body that follows a 512-byte CVD header.
 
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{Cursor, Read};
+use std::path::Path;
 
 use flate2::read::GzDecoder;
 use tar::Archive;
 
 use super::header::CVD_HEADER_SIZE;
 use crate::error::{Error, Result};
+use crate::signatures::is_signature_member;
 
 /// Files extracted from a CVD/CLD archive, keyed by file name (no path).
 #[derive(Debug, Clone, Default)]
@@ -39,11 +42,43 @@ pub fn unpack_cvd(data: &[u8]) -> Result<UnpackedDb> {
 
 pub fn unpack_body(body: &[u8]) -> Result<UnpackedDb> {
     let gz = GzDecoder::new(Cursor::new(body));
-    let mut archive = Archive::new(gz);
+    let mut files = BTreeMap::new();
+    for_each_archive_file(gz, true, true, |name, data| {
+        files.insert(name, data);
+        Ok(())
+    })?;
+    Ok(UnpackedDb { files })
+}
+
+/// Stream CVD tar members from disk without retaining the compressed file or
+/// previously visited members. The 512-byte header is skipped; callers should
+/// already have authenticated the file.
+///
+/// Non-signature members (bytecode, YARA, …) and PUA files (when `load_pua` is
+/// false) are consumed and discarded without keeping their contents.
+pub fn for_each_cvd_member(
+    path: impl AsRef<Path>,
+    load_pua: bool,
+    mut visit: impl FnMut(&str, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let path = path.as_ref();
+    let mut file = File::open(path).map_err(|e| Error::io(path, e))?;
+    let mut hdr = [0u8; CVD_HEADER_SIZE];
+    file.read_exact(&mut hdr).map_err(|e| Error::io(path, e))?;
+    let gz = GzDecoder::new(file);
+    for_each_archive_file(gz, false, load_pua, |name, data| visit(&name, &data))
+}
+
+fn for_each_archive_file<R: Read>(
+    reader: R,
+    load_all: bool,
+    load_pua: bool,
+    mut visit: impl FnMut(String, Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    let mut archive = Archive::new(reader);
     archive.set_overwrite(false);
     archive.set_preserve_permissions(false);
 
-    let mut files = BTreeMap::new();
     let entries = archive
         .entries()
         .map_err(|e| Error::CvdUnpack(e.to_string()))?;
@@ -59,13 +94,18 @@ pub fn unpack_body(body: &[u8]) -> Result<UnpackedDb> {
             .and_then(|s| s.to_str())
             .ok_or_else(|| Error::CvdUnpack("non-utf8 member name".into()))?
             .to_string();
+        if !load_all && !is_signature_member(&name, load_pua) {
+            std::io::copy(&mut entry, &mut std::io::sink())
+                .map_err(|e| Error::CvdUnpack(e.to_string()))?;
+            continue;
+        }
         let mut buf = Vec::new();
         entry
             .read_to_end(&mut buf)
             .map_err(|e| Error::CvdUnpack(e.to_string()))?;
-        files.insert(name, buf);
+        visit(name, buf)?;
     }
-    Ok(UnpackedDb { files })
+    Ok(())
 }
 
 /// Build a synthetic CVD body (gzip tar) from name → contents. Header is not included.
@@ -139,5 +179,34 @@ mod tests {
         assert_eq!(unpacked.files.len(), 2);
         assert_eq!(unpacked.get("test.hdb").unwrap(), files[0].1);
         assert_eq!(unpacked.get("test.ndb").unwrap(), files[1].1);
+    }
+
+    #[test]
+    fn for_each_member_matches_unpack() {
+        let files = [
+            (
+                "test.hdb",
+                b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:Eicar-Test-File\n".as_slice(),
+            ),
+            ("test.ndb", b"Eicar:0:*:585530\n".as_slice()),
+            ("skip.cbc", b"not-a-signature".as_slice()),
+        ];
+        let cvd = pack_cvd(&files, 1, "unit").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.cvd");
+        std::fs::write(&path, &cvd).unwrap();
+
+        let mut seen = Vec::new();
+        for_each_cvd_member(&path, false, |name, data| {
+            seen.push((name.to_string(), data.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, "test.hdb");
+        assert_eq!(seen[1].0, "test.ndb");
+        assert_eq!(seen[0].1, files[0].1);
+        assert_eq!(seen[1].1, files[1].1);
     }
 }

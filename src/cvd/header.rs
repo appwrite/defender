@@ -1,5 +1,9 @@
 //! 512-byte ClamAV CVD/CLD header parser.
 
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+
 use crate::error::{Error, Result};
 
 /// Size of the fixed CVD header prefix.
@@ -101,6 +105,15 @@ impl CvdHeader {
         })
     }
 
+    /// Read only the 512-byte header from `path` (does not load the gzip body).
+    pub fn read_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut file = File::open(path).map_err(|e| Error::io(path, e))?;
+        let mut buf = [0u8; CVD_HEADER_SIZE];
+        file.read_exact(&mut buf).map_err(|e| Error::io(path, e))?;
+        Self::parse(&buf)
+    }
+
     /// Serialize back to a 512-byte padded header.
     pub fn to_bytes(&self) -> [u8; CVD_HEADER_SIZE] {
         let s = format!(
@@ -196,5 +209,17 @@ mod tests {
         let bytes = h.to_bytes();
         let h2 = CvdHeader::parse(&bytes).unwrap();
         assert_eq!(h, h2);
+    }
+
+    #[test]
+    fn read_file_ignores_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daily.cvd");
+        let h = CvdHeader::parse_str(SAMPLE).unwrap();
+        let mut bytes = h.to_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 1024 * 1024]);
+        std::fs::write(&path, &bytes).unwrap();
+        let loaded = CvdHeader::read_file(&path).unwrap();
+        assert_eq!(loaded, h);
     }
 }

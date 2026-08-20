@@ -34,7 +34,8 @@ ENV DEFENDER_LISTEN=0.0.0.0:8080 \
     DEFENDER_UPDATE_INTERVAL_SECS=3600 \
     DEFENDER_MAX_BYTES=67108864 \
     DEFENDER_USER_AGENT="ClamAV/1.4.2 (defender; docker)" \
-    RUST_LOG=info
+    RUST_LOG=info \
+    MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000
 
 USER defender
 EXPOSE 8080

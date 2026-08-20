@@ -15,7 +15,7 @@ pub mod unpack;
 pub mod verify;
 
 pub use header::CvdHeader;
-pub use unpack::{unpack_cvd, UnpackedDb};
+pub use unpack::{for_each_cvd_member, unpack_cvd, UnpackedDb};
 pub use verify::{verify_cvd, verify_cvd_bytes, VerifyMode};
 
 use crate::error::Result;
