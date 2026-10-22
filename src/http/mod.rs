@@ -216,7 +216,7 @@ async fn scan_multipart_fields(
     state: AppState,
     mut multipart: Multipart,
 ) -> Result<Json<ScanResponse>, Error> {
-    while let Some(field) = multipart
+    if let Some(field) = multipart
         .next_field()
         .await
         .map_err(|e| Error::Http(e.to_string()))?

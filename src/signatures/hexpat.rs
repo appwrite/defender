@@ -826,7 +826,7 @@ mod tests {
             "64[2-4]616161",
             "41(B)424242",
         ];
-        let mut seed = 0xc0ff_eeu64;
+        let mut seed = 0x00c0_ffee_u64;
         let mut hays: Vec<Vec<u8>> = vec![
             vec![],
             b"A".to_vec(),
