@@ -450,6 +450,7 @@ impl Engine {
         };
         let mut counts: FxHashMap<(usize, usize), u32> = FxHashMap::default();
         let mut dirty: FxHashSet<usize> = FxHashSet::default();
+        let mut seen_logical: FxHashSet<(usize, usize, usize)> = FxHashSet::default();
 
         if let Some(ac) = &self.ac {
             for m in ac.find_overlapping_iter(data) {
@@ -485,15 +486,19 @@ impl Engine {
                             }
                         }
                         let sub = &rule.sig.subsigs[si];
-                        if pattern_matches_at_anchor(
-                            &sub.pattern,
-                            &sub.offset,
-                            data,
-                            start,
-                            pe.as_ref(),
-                        ) {
-                            *counts.entry((li, si)).or_insert(0) += 1;
-                            dirty.insert(li);
+                        let Some(range) = sub.pattern.candidate_start_range(start) else {
+                            continue;
+                        };
+                        for pat_start in range {
+                            if !offset_ok(&sub.offset, pat_start, data.len(), pe.as_ref())
+                                || !sub.pattern.matches_at(data, pat_start)
+                            {
+                                continue;
+                            }
+                            if seen_logical.insert((li, si, pat_start)) {
+                                *counts.entry((li, si)).or_insert(0) += 1;
+                                dirty.insert(li);
+                            }
                         }
                     }
                 }
@@ -1080,6 +1085,42 @@ mod tests {
             ScanVerdict::Clean => panic!("shifted variable-skip body signature not detected"),
         }
         assert!(matches!(eng.scan(b"nope").verdict, ScanVerdict::Clean));
+    }
+
+    #[test]
+    fn logical_count_dedups_overlapping_variable_anchor_hits() {
+        // A {0-3} BBB: overlapping BBB hits all verify the same start.
+        let once = "Test.Once;Target:0;0=1;41{0-3}424242\n";
+        let twice = "Test.Twice;Target:0;0=2;41{0-3}424242\n";
+        let once_eng = Engine::from_cvd_bytes(
+            "t",
+            &pack_cvd(&[("t.ldb", once.as_bytes())], 1, "u").unwrap(),
+            VerifyMode::Integrity,
+            false,
+        )
+        .unwrap();
+        let twice_eng = Engine::from_cvd_bytes(
+            "t",
+            &pack_cvd(&[("t.ldb", twice.as_bytes())], 1, "u").unwrap(),
+            VerifyMode::Integrity,
+            false,
+        )
+        .unwrap();
+
+        match once_eng.scan(b"ABBBB").verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("Once")),
+            ScanVerdict::Clean => panic!("single shifted logical match counted more than once"),
+        }
+        assert!(matches!(
+            twice_eng.scan(b"ABBBB").verdict,
+            ScanVerdict::Clean
+        ));
+
+        // Two genuine starts: A BBB A BBB.
+        match twice_eng.scan(b"ABBBABBB").verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("Twice")),
+            ScanVerdict::Clean => panic!("two distinct logical starts not counted separately"),
+        }
     }
 
     #[test]
