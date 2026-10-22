@@ -216,7 +216,7 @@ async fn scan_multipart_fields(
     state: AppState,
     mut multipart: Multipart,
 ) -> Result<Json<ScanResponse>, Error> {
-    while let Some(field) = multipart
+    if let Some(field) = multipart
         .next_field()
         .await
         .map_err(|e| Error::Http(e.to_string()))?
@@ -231,7 +231,7 @@ async fn scan_multipart_fields(
         let mut hasher = IncrementalHashers::new();
         hasher.update(&bytes);
         let hashes = hasher.finalize();
-        return Ok(Json(finish_scan(&state, &bytes, &hashes)));
+        return Ok(Json(finish_scan(&state, &bytes, &hashes)?));
     }
     Err(Error::Http("multipart body had no file field".into()))
 }
@@ -249,13 +249,27 @@ async fn scan_body(state: AppState, body: Body) -> Result<ScanResponse, Error> {
         buf.extend_from_slice(&chunk);
     }
     let hashes = hasher.finalize();
-    Ok(finish_scan(&state, &buf, &hashes))
+    finish_scan(&state, &buf, &hashes)
 }
 
-fn finish_scan(state: &AppState, data: &[u8], hashes: &crate::engine::HashBytes) -> ScanResponse {
+fn run_scan_protected<F>(f: F) -> Result<crate::engine::ScanResult, Error>
+where
+    F: FnOnce() -> crate::engine::ScanResult + std::panic::UnwindSafe,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| {
+        tracing::error!("scan panicked");
+        Error::Http("scan failed".into())
+    })
+}
+
+fn finish_scan(
+    state: &AppState,
+    data: &[u8],
+    hashes: &crate::engine::HashBytes,
+) -> Result<ScanResponse, Error> {
     let t0 = Instant::now();
     let eng = state.db.current();
-    let result = eng.scan_prehashed(data, hashes);
+    let result = run_scan_protected(|| eng.scan_prehashed(data, hashes))?;
     let duration_us = t0.elapsed().as_micros() as u64;
     match result.verdict {
         ScanVerdict::Clean => {
@@ -265,7 +279,7 @@ fn finish_scan(state: &AppState, data: &[u8], hashes: &crate::engine::HashBytes)
                 md5 = %result.hashes.md5,
                 "scan clean"
             );
-            ScanResponse {
+            Ok(ScanResponse {
                 result: "clean",
                 signature: None,
                 size: result.hashes.size,
@@ -273,7 +287,7 @@ fn finish_scan(state: &AppState, data: &[u8], hashes: &crate::engine::HashBytes)
                 sha1: result.hashes.sha1,
                 sha256: result.hashes.sha256,
                 duration_us,
-            }
+            })
         }
         ScanVerdict::Infected { signature } => {
             tracing::info!(
@@ -283,7 +297,7 @@ fn finish_scan(state: &AppState, data: &[u8], hashes: &crate::engine::HashBytes)
                 md5 = %result.hashes.md5,
                 "scan infected"
             );
-            ScanResponse {
+            Ok(ScanResponse {
                 result: "infected",
                 signature: Some(signature),
                 size: result.hashes.size,
@@ -291,7 +305,7 @@ fn finish_scan(state: &AppState, data: &[u8], hashes: &crate::engine::HashBytes)
                 sha1: result.hashes.sha1,
                 sha256: result.hashes.sha256,
                 duration_us,
-            }
+            })
         }
     }
 }
@@ -629,5 +643,14 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn scan_panic_is_isolated() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let err = run_scan_protected(|| panic!("isolated scan panic"));
+        std::panic::set_hook(prev);
+        assert!(err.is_err());
     }
 }

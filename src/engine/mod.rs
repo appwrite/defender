@@ -450,6 +450,11 @@ impl Engine {
         };
         let mut counts: FxHashMap<(usize, usize), u32> = FxHashMap::default();
         let mut dirty: FxHashSet<usize> = FxHashSet::default();
+        let mut seen_logical: FxHashSet<(usize, usize, usize)> = FxHashSet::default();
+        let mut logical_cores: FxHashMap<(usize, usize), PrefixCore> = FxHashMap::default();
+        let mut logical_cores_done: FxHashSet<(usize, usize)> = FxHashSet::default();
+        let mut logical_skip_hi: FxHashMap<(usize, usize), usize> = FxHashMap::default();
+        let mut body_unbounded_done: FxHashSet<usize> = FxHashSet::default();
 
         if let Some(ac) = &self.ac {
             for m in ac.find_overlapping_iter(data) {
@@ -461,12 +466,26 @@ impl Engine {
                         if !target_ok(rule.target, kind) {
                             continue;
                         }
-                        let pat_start = start.saturating_sub(rule.pattern.anchor_off);
-                        if !offset_ok(&rule.offset, pat_start, data.len(), pe.as_ref()) {
-                            continue;
-                        }
-                        if rule.pattern.matches_at(data, pat_start) && !self.is_ignored(&rule.name)
-                        {
+                        let hit = if rule.pattern.anchor_max_off.is_none() {
+                            // One full search per unbounded body rule. Re-checking
+                            // every cached prefix-core start on each later anchor
+                            // hit is Θ(n²) when both the core and the anchor repeat.
+                            if !body_unbounded_done.insert(ri) {
+                                continue;
+                            }
+                            find_with_offset(&rule.pattern, &rule.offset, data, pe.as_ref())
+                                .is_some()
+                        } else {
+                            pattern_matches_at_anchor(
+                                &rule.pattern,
+                                &rule.offset,
+                                data,
+                                start,
+                                pe.as_ref(),
+                                None,
+                            )
+                        };
+                        if hit && !self.is_ignored(&rule.name) {
                             return Some(rule.name.clone());
                         }
                     }
@@ -482,14 +501,53 @@ impl Engine {
                                 continue;
                             }
                         }
-                        let sub = &rule.sig.subsigs[si];
-                        let pat_start = start.saturating_sub(sub.pattern.anchor_off);
-                        if !offset_ok(&sub.offset, pat_start, data.len(), pe.as_ref()) {
+                        if logical_cores_done.contains(&(li, si)) {
                             continue;
                         }
-                        if sub.pattern.matches_at(data, pat_start) {
-                            *counts.entry((li, si)).or_insert(0) += 1;
-                            dirty.insert(li);
+                        let sub = &rule.sig.subsigs[si];
+                        let Some(range) = sub.pattern.candidate_start_range(start) else {
+                            continue;
+                        };
+                        let cores =
+                            prefix_core_for(&mut logical_cores, (li, si), &sub.pattern, data);
+                        let lo = *range.start();
+                        let hi = *range.end();
+                        match cores {
+                            Some(starts) => {
+                                // `matches_at` does not depend on this anchor, so
+                                // every core start is scored once for the rule.
+                                logical_cores_done.insert((li, si));
+                                for &pat_start in starts {
+                                    if !offset_ok(&sub.offset, pat_start, data.len(), pe.as_ref())
+                                        || !sub.pattern.matches_at(data, pat_start)
+                                    {
+                                        continue;
+                                    }
+                                    if seen_logical.insert((li, si, pat_start)) {
+                                        *counts.entry((li, si)).or_insert(0) += 1;
+                                        dirty.insert(li);
+                                    }
+                                }
+                            }
+                            None => {
+                                if !sub.pattern.suffix_matches(data, start) {
+                                    continue;
+                                }
+                                let prev = logical_skip_hi.get(&(li, si)).copied();
+                                let added = count_skip_only_starts(
+                                    &sub.offset,
+                                    data.len(),
+                                    pe.as_ref(),
+                                    lo,
+                                    hi,
+                                    prev,
+                                );
+                                if added > 0 {
+                                    *counts.entry((li, si)).or_insert(0) += added;
+                                    dirty.insert(li);
+                                }
+                                logical_skip_hi.insert((li, si), hi);
+                            }
                         }
                     }
                 }
@@ -579,41 +637,142 @@ fn target_ok(need: TargetType, have: TargetType) -> bool {
 }
 
 fn offset_ok(off: &OffsetKind, at: usize, len: usize, pe: Option<&PeImage>) -> bool {
+    match offset_start_bounds(off, len, pe) {
+        Some((lo, hi)) => at >= lo && at <= hi,
+        None => false,
+    }
+}
+
+/// Inclusive pattern-start range allowed by `off`, or `None` when the
+/// offset cannot be resolved (PE-relative kinds without a PE image).
+fn offset_start_bounds(
+    off: &OffsetKind,
+    len: usize,
+    pe: Option<&PeImage>,
+) -> Option<(usize, usize)> {
     match *off {
-        OffsetKind::Any => true,
-        OffsetKind::Absolute { at: start, shift } => {
-            at >= start as usize && at <= start as usize + shift as usize
+        OffsetKind::Any => Some((0, usize::MAX)),
+        OffsetKind::Absolute { at, shift } => {
+            let start = at as usize;
+            Some((start, start.saturating_add(shift as usize)))
         }
         OffsetKind::Eof { n, shift } => {
             let base = len.saturating_sub(n as usize);
-            at >= base && at <= base + shift as usize
+            Some((base, base.saturating_add(shift as usize)))
         }
         OffsetKind::EntryPoint { add, shift } => {
-            let Some(pe) = pe else { return false };
+            let pe = pe?;
             let base = if add >= 0 {
                 pe.entry_point_off.saturating_add(add as usize)
             } else {
                 pe.entry_point_off.saturating_sub((-add) as usize)
             };
-            at >= base && at <= base + shift as usize
+            Some((base, base.saturating_add(shift as usize)))
         }
         OffsetKind::Section { index, add, shift } => {
-            let Some(pe) = pe else { return false };
-            let Some(s) = pe.sections.get(index as usize) else {
-                return false;
-            };
+            let pe = pe?;
+            let s = pe.sections.get(index as usize)?;
             let base = s.raw_ptr.saturating_add(add as usize);
-            at >= base && at <= base + shift as usize
+            Some((base, base.saturating_add(shift as usize)))
         }
         OffsetKind::LastSection { add, shift } => {
-            let Some(pe) = pe else { return false };
-            let Some(s) = pe.sections.last() else {
-                return false;
-            };
+            let pe = pe?;
+            let s = pe.sections.last()?;
             let base = s.raw_ptr.saturating_add(add as usize);
-            at >= base && at <= base + shift as usize
+            Some((base, base.saturating_add(shift as usize)))
         }
     }
+}
+
+fn count_skip_only_starts(
+    offset: &OffsetKind,
+    len: usize,
+    pe: Option<&PeImage>,
+    lo: usize,
+    hi: usize,
+    prev_hi: Option<usize>,
+) -> u32 {
+    let Some((off_lo, off_hi)) = offset_start_bounds(offset, len, pe) else {
+        return 0;
+    };
+    let new_lo = match prev_hi {
+        Some(p) => p.saturating_add(1).max(lo),
+        None => lo,
+    };
+    if new_lo > hi {
+        return 0;
+    }
+    let a = new_lo.max(off_lo);
+    let b = hi.min(off_hi);
+    if a > b {
+        0
+    } else {
+        u32::try_from(b - a + 1).unwrap_or(u32::MAX)
+    }
+}
+
+enum PrefixCore {
+    SkipOnly,
+    Starts(Vec<usize>),
+}
+
+fn prefix_core_for<'a, K: Eq + std::hash::Hash>(
+    cache: &'a mut FxHashMap<K, PrefixCore>,
+    key: K,
+    pattern: &HexPattern,
+    data: &[u8],
+) -> Option<&'a [usize]> {
+    let entry = cache
+        .entry(key)
+        .or_insert_with(|| match pattern.prefix_core_starts(data) {
+            None => PrefixCore::SkipOnly,
+            Some(v) => PrefixCore::Starts(v),
+        });
+    match entry {
+        PrefixCore::SkipOnly => None,
+        PrefixCore::Starts(v) => Some(v.as_slice()),
+    }
+}
+
+fn pattern_matches_at_anchor(
+    pattern: &HexPattern,
+    offset: &OffsetKind,
+    data: &[u8],
+    anchor_at: usize,
+    pe: Option<&PeImage>,
+    core_starts: Option<&[usize]>,
+) -> bool {
+    let Some(range) = pattern.candidate_start_range(anchor_at) else {
+        return false;
+    };
+    let lo = *range.start();
+    let hi = *range.end();
+    if let Some(cores) = core_starts {
+        if cores.is_empty() || !pattern.suffix_matches(data, anchor_at) {
+            return false;
+        }
+        return cores.iter().any(|&s| {
+            s >= lo
+                && s <= hi
+                && offset_ok(offset, s, data.len(), pe)
+                && pattern.matches_at(data, s)
+        });
+    }
+    const SMALL: usize = 64;
+    if hi.saturating_sub(lo) <= SMALL || pattern.anchor_max_off.is_some() {
+        return (lo..=hi).any(|pat_start| {
+            offset_ok(offset, pat_start, data.len(), pe) && pattern.matches_at(data, pat_start)
+        });
+    }
+    if !pattern.suffix_matches(data, anchor_at) {
+        return false;
+    }
+    let Some((off_lo, off_hi)) = offset_start_bounds(offset, data.len(), pe) else {
+        return false;
+    };
+    let a = lo.max(off_lo);
+    let b = hi.min(off_hi);
+    a <= b && pattern.matches_at(data, a)
 }
 
 fn find_with_offset(
@@ -622,34 +781,11 @@ fn find_with_offset(
     data: &[u8],
     pe: Option<&PeImage>,
 ) -> Option<usize> {
-    let (from, to) = match *offset {
-        OffsetKind::Any => (0, None),
-        OffsetKind::Absolute { at, shift } => (at as usize, Some(at as usize + shift as usize + 1)),
-        OffsetKind::Eof { n, shift } => {
-            let base = data.len().saturating_sub(n as usize);
-            (base, Some(base + shift as usize + 1))
-        }
-        OffsetKind::EntryPoint { add, shift } => {
-            let pe = pe?;
-            let base = if add >= 0 {
-                pe.entry_point_off.saturating_add(add as usize)
-            } else {
-                pe.entry_point_off.saturating_sub((-add) as usize)
-            };
-            (base, Some(base + shift as usize + 1))
-        }
-        OffsetKind::Section { index, add, shift } => {
-            let pe = pe?;
-            let s = pe.sections.get(index as usize)?;
-            let base = s.raw_ptr.saturating_add(add as usize);
-            (base, Some(base + shift as usize + 1))
-        }
-        OffsetKind::LastSection { add, shift } => {
-            let pe = pe?;
-            let s = pe.sections.last()?;
-            let base = s.raw_ptr.saturating_add(add as usize);
-            (base, Some(base + shift as usize + 1))
-        }
+    let (from, hi) = offset_start_bounds(offset, data.len(), pe)?;
+    let to = if hi == usize::MAX {
+        None
+    } else {
+        Some(hi.saturating_add(1))
     };
     pattern.find(data, from, to)
 }
@@ -1039,6 +1175,175 @@ mod tests {
             pe_eng.scan(&mz).verdict,
             ScanVerdict::Infected { .. }
         ));
+    }
+
+    #[test]
+    fn body_sig_unbounded_prefix_absent_core_is_clean() {
+        let ndb = "Test.AbsCore:0:*:4142*414141\n";
+        let cvd = pack_cvd(&[("t.ndb", ndb.as_bytes())], 1, "u").unwrap();
+        let eng = Engine::from_cvd_bytes("t", &cvd, VerifyMode::Integrity, false).unwrap();
+        assert!(matches!(
+            eng.scan(&vec![b'A'; 8192]).verdict,
+            ScanVerdict::Clean
+        ));
+
+        let mut hit = vec![0u8; 80];
+        hit[10] = b'A';
+        hit[11] = b'B';
+        hit[50] = b'A';
+        hit[51] = b'A';
+        hit[52] = b'A';
+        match eng.scan(&hit).verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("AbsCore")),
+            ScanVerdict::Clean => panic!("AB*AAA shifted match not detected"),
+        }
+    }
+
+    #[test]
+    fn body_sig_variable_skip_matches_shifted_payload() {
+        let ndb = "Test.VarSkip:0:*:41{1-3}42424242\n";
+        let cvd = pack_cvd(&[("t.ndb", ndb.as_bytes())], 1, "u").unwrap();
+        let eng = Engine::from_cvd_bytes("t", &cvd, VerifyMode::Integrity, false).unwrap();
+
+        let mut data = b"xxxx".to_vec();
+        data.push(b'A');
+        data.extend_from_slice(&[0x2c, 0x2c]);
+        data.extend_from_slice(b"BBBB");
+        match eng.scan(&data).verdict {
+            ScanVerdict::Infected { signature } => {
+                assert!(signature.contains("VarSkip"));
+            }
+            ScanVerdict::Clean => panic!("shifted variable-skip body signature not detected"),
+        }
+        assert!(matches!(eng.scan(b"nope").verdict, ScanVerdict::Clean));
+    }
+
+    #[test]
+    fn logical_count_dedups_overlapping_variable_anchor_hits() {
+        // A {0-3} BBB: overlapping BBB hits all verify the same start.
+        let once = "Test.Once;Target:0;0=1;41{0-3}424242\n";
+        let twice = "Test.Twice;Target:0;0=2;41{0-3}424242\n";
+        let once_eng = Engine::from_cvd_bytes(
+            "t",
+            &pack_cvd(&[("t.ldb", once.as_bytes())], 1, "u").unwrap(),
+            VerifyMode::Integrity,
+            false,
+        )
+        .unwrap();
+        let twice_eng = Engine::from_cvd_bytes(
+            "t",
+            &pack_cvd(&[("t.ldb", twice.as_bytes())], 1, "u").unwrap(),
+            VerifyMode::Integrity,
+            false,
+        )
+        .unwrap();
+
+        match once_eng.scan(b"ABBBB").verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("Once")),
+            ScanVerdict::Clean => panic!("single shifted logical match counted more than once"),
+        }
+        assert!(matches!(
+            twice_eng.scan(b"ABBBB").verdict,
+            ScanVerdict::Clean
+        ));
+
+        // Two genuine starts: A BBB A BBB.
+        match twice_eng.scan(b"ABBBABBB").verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("Twice")),
+            ScanVerdict::Clean => panic!("two distinct logical starts not counted separately"),
+        }
+    }
+
+    fn abc_at(offset: usize) -> Vec<u8> {
+        let mut data = vec![0u8; offset.saturating_add(3)];
+        data[offset] = b'A';
+        data[offset + 1] = b'B';
+        data[offset + 2] = b'C';
+        data
+    }
+
+    #[test]
+    fn body_sig_skip_only_absolute_offset_matches() {
+        let ndb = "Test.Off:0:100:*414243\n";
+        let cvd = pack_cvd(&[("t.ndb", ndb.as_bytes())], 1, "u").unwrap();
+        let eng = Engine::from_cvd_bytes("t", &cvd, VerifyMode::Integrity, false).unwrap();
+
+        match eng.scan(&abc_at(200)).verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("Off")),
+            ScanVerdict::Clean => {
+                panic!("skip-only *ABC at absolute offset 100 missed ABC at byte 200")
+            }
+        }
+        match eng.scan(&abc_at(100)).verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("Off")),
+            ScanVerdict::Clean => panic!("*ABC starting at offset 100 not detected"),
+        }
+        assert!(matches!(eng.scan(&abc_at(50)).verdict, ScanVerdict::Clean));
+        assert!(matches!(eng.scan(b"ABC").verdict, ScanVerdict::Clean));
+    }
+
+    #[test]
+    fn body_sig_matching_unbounded_prefix_is_found_once() {
+        let ndb = "Test.ManyA:0:*:4141*414141\n";
+        let cvd = pack_cvd(&[("t.ndb", ndb.as_bytes())], 1, "u").unwrap();
+        let eng = Engine::from_cvd_bytes("t", &cvd, VerifyMode::Integrity, false).unwrap();
+        match eng.scan(&vec![b'A'; 8192]).verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("ManyA")),
+            ScanVerdict::Clean => panic!("AA*AAA on a long A buffer not detected"),
+        }
+    }
+
+    #[test]
+    fn logical_skip_only_absolute_offset_matches() {
+        let ldb = "Test.OffLog;Target:0;0;100:*414243\n";
+        let cvd = pack_cvd(&[("t.ldb", ldb.as_bytes())], 1, "u").unwrap();
+        let eng = Engine::from_cvd_bytes("t", &cvd, VerifyMode::Integrity, false).unwrap();
+        match eng.scan(&abc_at(200)).verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("OffLog")),
+            ScanVerdict::Clean => {
+                panic!("logical skip-only *ABC at offset 100 missed ABC at byte 200")
+            }
+        }
+        assert!(matches!(eng.scan(&abc_at(50)).verdict, ScanVerdict::Clean));
+    }
+
+    #[test]
+    fn logical_unbounded_prefix_counts_each_core_start_once() {
+        let once = "Test.CoreOnce;Target:0;0=1;4142*434343\n";
+        let twice = "Test.CoreTwice;Target:0;0=2;4142*434343\n";
+        let once_eng = Engine::from_cvd_bytes(
+            "t",
+            &pack_cvd(&[("t.ldb", once.as_bytes())], 1, "u").unwrap(),
+            VerifyMode::Integrity,
+            false,
+        )
+        .unwrap();
+        let twice_eng = Engine::from_cvd_bytes(
+            "t",
+            &pack_cvd(&[("t.ldb", twice.as_bytes())], 1, "u").unwrap(),
+            VerifyMode::Integrity,
+            false,
+        )
+        .unwrap();
+
+        let one = b"AB----CCC";
+        match once_eng.scan(one).verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("CoreOnce")),
+            ScanVerdict::Clean => panic!("single AB*CCC start not counted as one"),
+        }
+        assert!(matches!(twice_eng.scan(one).verdict, ScanVerdict::Clean));
+
+        let two = b"AB----CCCAB----CCC";
+        match twice_eng.scan(two).verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("CoreTwice")),
+            ScanVerdict::Clean => panic!("two AB*CCC starts not counted separately"),
+        }
+        match once_eng.scan(two).verdict {
+            ScanVerdict::Infected { .. } => {
+                panic!("two AB*CCC starts should not satisfy =1")
+            }
+            ScanVerdict::Clean => {}
+        }
     }
 
     #[test]
