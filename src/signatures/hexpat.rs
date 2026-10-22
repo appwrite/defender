@@ -8,8 +8,12 @@ pub struct HexPattern {
     pub tokens: Vec<Token>,
     /// Longest literal fragment, used as an Aho-Corasick needle.
     pub anchor: Vec<u8>,
-    /// Byte offset of `anchor` from the start of a fully-literal prefix.
+    /// Minimum byte offset of `anchor` from the start of a match.
     pub anchor_off: usize,
+    /// Maximum byte offset of `anchor` from the start of a match.
+    /// `None` when a preceding skip is unbounded. Equal to `Some(anchor_off)`
+    /// when every token before the anchor has a single width.
+    pub anchor_max_off: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,12 +46,7 @@ pub enum Token {
 impl HexPattern {
     pub fn parse(sig: &str) -> Result<Self> {
         let tokens = tokenize(sig)?;
-        let (anchor, anchor_off) = longest_anchor(&tokens);
-        Ok(Self {
-            tokens,
-            anchor,
-            anchor_off,
-        })
+        Ok(compile(tokens))
     }
 
     pub fn min_len(&self) -> usize {
@@ -74,27 +73,71 @@ impl HexPattern {
         if from > end {
             return None;
         }
-        if !self.anchor.is_empty() {
-            let mut search_from = from.saturating_add(self.anchor_off);
-            while let Some(rel) = find_slice(&haystack[search_from..end], &self.anchor) {
-                let anchor_at = search_from + rel;
-                let start = anchor_at.saturating_sub(self.anchor_off);
-                if start >= from && start <= end && self.matches_at(haystack, start) {
-                    return Some(start);
-                }
-                search_from = anchor_at.saturating_add(1);
-                if search_from >= end {
-                    break;
-                }
-            }
-            return None;
+        if self.anchor.is_empty() {
+            return (from..=end).find(|&i| self.matches_at(haystack, i));
         }
-        for i in from..=end {
-            if self.matches_at(haystack, i) {
-                return Some(i);
+        let mut search_from = from.saturating_add(self.anchor_off);
+        while let Some(window) = haystack.get(search_from..end) {
+            let Some(rel) = find_slice(window, &self.anchor) else {
+                break;
+            };
+            let anchor_at = search_from + rel;
+            if let Some(start) = self.match_start_for_anchor(haystack, anchor_at, from, end) {
+                return Some(start);
+            }
+            search_from = anchor_at.saturating_add(1);
+            if search_from >= end {
+                break;
             }
         }
         None
+    }
+
+    /// Pattern-start positions that could place `anchor` at `anchor_at`.
+    pub(crate) fn candidate_start_range(
+        &self,
+        anchor_at: usize,
+    ) -> Option<std::ops::RangeInclusive<usize>> {
+        let min = self.anchor_off;
+        if anchor_at < min {
+            return None;
+        }
+        let hi = anchor_at - min;
+        let lo = match self.anchor_max_off {
+            Some(max) => anchor_at.saturating_sub(max),
+            None => 0,
+        };
+        if lo > hi {
+            None
+        } else {
+            Some(lo..=hi)
+        }
+    }
+
+    fn match_start_for_anchor(
+        &self,
+        haystack: &[u8],
+        anchor_at: usize,
+        from: usize,
+        end: usize,
+    ) -> Option<usize> {
+        let range = self.candidate_start_range(anchor_at)?;
+        let lo = (*range.start()).max(from);
+        let hi = (*range.end()).min(end);
+        if lo > hi {
+            return None;
+        }
+        (lo..=hi).find(|&start| self.matches_at(haystack, start))
+    }
+}
+
+fn compile(tokens: Vec<Token>) -> HexPattern {
+    let (anchor, anchor_off, anchor_max_off) = longest_anchor(&tokens);
+    HexPattern {
+        tokens,
+        anchor,
+        anchor_off,
+        anchor_max_off,
     }
 }
 
@@ -307,35 +350,58 @@ fn find_matching_paren(s: &[u8], open: usize) -> Result<usize> {
     Err(err(std::str::from_utf8(s).unwrap_or(""), "unclosed '('"))
 }
 
-fn longest_anchor(tokens: &[Token]) -> (Vec<u8>, usize) {
-    let mut best: &[u8] = &[];
-    let mut best_off = 0usize;
-    let mut off = 0usize;
-    for t in tokens {
-        match t {
-            Token::Lit(v) => {
-                if v.len() > best.len() {
-                    best = v;
-                    best_off = off;
-                }
-                off += v.len();
+fn token_width(t: &Token) -> (usize, Option<usize>) {
+    match t {
+        Token::Lit(v) => (v.len(), Some(v.len())),
+        Token::Any | Token::Nibble { .. } | Token::NonAlnum => (1, Some(1)),
+        Token::Skip { min, max } => (*min, *max),
+        Token::Alt { options, negated } => {
+            if *negated {
+                let w = options.first().map(|o| o.len()).unwrap_or(1);
+                (w, Some(w))
+            } else {
+                (
+                    options.iter().map(|o| o.len()).min().unwrap_or(0),
+                    options.iter().map(|o| o.len()).max(),
+                )
             }
-            Token::Any | Token::Nibble { .. } => off += 1,
-            Token::Skip { min, max } => {
-                // Unbounded / wide skips break a contiguous prefix offset.
-                if max.is_none() || max.unwrap().saturating_sub(*min) > 0 {
-                    off = usize::MAX / 4;
-                } else {
-                    off += *min;
-                }
-            }
-            Token::Alt { options, .. } => {
-                off += options.iter().map(|o| o.len()).min().unwrap_or(0);
-            }
-            Token::WordBoundary | Token::LineBoundary | Token::NonAlnum => {}
         }
+        Token::WordBoundary => (0, Some(0)),
+        // File bounds consume 0; CR/LF in the middle consume 1 or 2.
+        Token::LineBoundary => (0, Some(2)),
     }
-    (best.to_vec(), best_off)
+}
+
+fn add_width(min: &mut usize, max: &mut Option<usize>, dmin: usize, dmax: Option<usize>) {
+    *min = min.saturating_add(dmin);
+    *max = match (*max, dmax) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        _ => None,
+    };
+}
+
+fn longest_anchor(tokens: &[Token]) -> (Vec<u8>, usize, Option<usize>) {
+    let mut best: &[u8] = &[];
+    let mut best_min = 0usize;
+    let mut best_max = Some(0usize);
+    let mut min_off = 0usize;
+    let mut max_off = Some(0usize);
+    for t in tokens {
+        if let Token::Lit(v) = t {
+            if v.len() > best.len() {
+                best = v;
+                best_min = min_off;
+                best_max = max_off;
+            }
+        }
+        let (dmin, dmax) = token_width(t);
+        add_width(&mut min_off, &mut max_off, dmin, dmax);
+    }
+    (best.to_vec(), best_min, best_max)
+}
+
+fn remaining_ok(pos: usize, need: usize, hay_len: usize) -> bool {
+    need <= hay_len.saturating_sub(pos)
 }
 
 fn match_tokens(tokens: &[Token], hay: &[u8], pos: usize) -> Option<usize> {
@@ -344,7 +410,9 @@ fn match_tokens(tokens: &[Token], hay: &[u8], pos: usize) -> Option<usize> {
         while i < tokens.len() {
             match &tokens[i] {
                 Token::Lit(v) => {
-                    if pos + v.len() > hay.len() || &hay[pos..pos + v.len()] != v.as_slice() {
+                    if !remaining_ok(pos, v.len(), hay.len())
+                        || &hay[pos..pos + v.len()] != v.as_slice()
+                    {
                         return None;
                     }
                     pos += v.len();
@@ -377,7 +445,7 @@ fn match_tokens(tokens: &[Token], hay: &[u8], pos: usize) -> Option<usize> {
                 }
                 Token::Skip { min, max } => {
                     let rest = &tokens[i + 1..];
-                    let start = pos + *min;
+                    let start = pos.saturating_add(*min);
                     if start > hay.len() {
                         return None;
                     }
@@ -395,15 +463,17 @@ fn match_tokens(tokens: &[Token], hay: &[u8], pos: usize) -> Option<usize> {
                             return None;
                         }
                         Some(max) => {
-                            let hi = (pos + max).min(hay.len());
+                            let hi = pos.saturating_add(max).min(hay.len());
                             if rest.is_empty() {
-                                return if start <= hay.len()
-                                    && pos + max >= hay.len().saturating_sub(0)
+                                return if start <= hay.len() && pos.saturating_add(max) >= hay.len()
                                 {
                                     Some(hay.len())
                                 } else {
                                     Some(start.min(hay.len()))
                                 };
+                            }
+                            if start > hi {
+                                return None;
                             }
                             for npos in start..=hi {
                                 if rec(rest, hay, npos).is_some() {
@@ -417,7 +487,7 @@ fn match_tokens(tokens: &[Token], hay: &[u8], pos: usize) -> Option<usize> {
                 Token::Alt { options, negated } => {
                     if *negated {
                         let width = options.first().map(|o| o.len()).unwrap_or(1);
-                        if pos + width > hay.len() {
+                        if !remaining_ok(pos, width, hay.len()) {
                             return None;
                         }
                         let slice = &hay[pos..pos + width];
@@ -428,7 +498,7 @@ fn match_tokens(tokens: &[Token], hay: &[u8], pos: usize) -> Option<usize> {
                     } else {
                         let mut hit = false;
                         for o in options {
-                            if pos + o.len() <= hay.len()
+                            if remaining_ok(pos, o.len(), hay.len())
                                 && &hay[pos..pos + o.len()] == o.as_slice()
                             {
                                 pos += o.len();
@@ -443,6 +513,9 @@ fn match_tokens(tokens: &[Token], hay: &[u8], pos: usize) -> Option<usize> {
                     i += 1;
                 }
                 Token::WordBoundary => {
+                    if pos > hay.len() {
+                        return None;
+                    }
                     let left = if pos == 0 {
                         true
                     } else {
@@ -475,6 +548,9 @@ fn match_tokens(tokens: &[Token], hay: &[u8], pos: usize) -> Option<usize> {
                     i += 1;
                 }
                 Token::LineBoundary => {
+                    if pos > hay.len() {
+                        return None;
+                    }
                     if pos == 0 || pos == hay.len() {
                         i += 1;
                     } else if hay[pos] == b'\n' {
@@ -541,12 +617,7 @@ pub fn widen(pattern: &HexPattern) -> HexPattern {
             other => other.clone(),
         })
         .collect();
-    let (anchor, anchor_off) = longest_anchor(&tokens);
-    HexPattern {
-        tokens,
-        anchor,
-        anchor_off,
-    }
+    compile(tokens)
 }
 
 #[cfg(test)]
@@ -618,5 +689,161 @@ mod tests {
         let p = HexPattern::parse("4141(W)4242").unwrap();
         assert!(p.find(b"AA-BB", 0, None).is_some());
         assert!(p.find(b"AAxBB", 0, None).is_none());
+    }
+
+    #[test]
+    fn variable_skip_records_prefix_span() {
+        let p = HexPattern::parse("41{1-3}424242").unwrap();
+        assert_eq!(p.anchor, b"BBB");
+        assert_eq!(p.anchor_off, 2);
+        assert_eq!(p.anchor_max_off, Some(4));
+
+        let p = HexPattern::parse("41*42424242").unwrap();
+        assert_eq!(p.anchor, b"BBBB");
+        assert_eq!(p.anchor_off, 1);
+        assert_eq!(p.anchor_max_off, None);
+
+        let p = HexPattern::parse("{2-}414243").unwrap();
+        assert_eq!(p.anchor, b"ABC");
+        assert_eq!(p.anchor_off, 2);
+        assert_eq!(p.anchor_max_off, None);
+    }
+
+    #[test]
+    fn find_does_not_panic_on_short_haystack_or_large_from() {
+        let p = HexPattern::parse("41{1-3}424242").unwrap();
+        assert!(p.find(b"ABBB", 0, None).is_some());
+        assert!(p.find(b"xx", 0, None).is_none());
+        assert!(p.find(b"", 0, None).is_none());
+        assert!(p.find(b"ABC", 10, None).is_none());
+        assert!(p.find(b"ABBB", usize::MAX, None).is_none());
+
+        let p = HexPattern::parse("41424344").unwrap();
+        assert!(p.find(b"ABCD", 8, None).is_none());
+        assert!(p.find(b"AB", 0, Some(1)).is_none());
+        assert!(p.find(b"ABCD", 3, Some(3)).is_none());
+    }
+
+    #[test]
+    fn find_shifted_match_when_anchor_follows_variable_skip() {
+        let p = HexPattern::parse("41{1-3}424242").unwrap();
+        let mut hay = b"xxxxA".to_vec();
+        hay.extend_from_slice(&[0x11, 0x22]);
+        hay.extend_from_slice(b"BBB");
+        assert_eq!(p.find(&hay, 0, None), Some(4));
+        assert_eq!(p.find(b"ABBB", 0, None), Some(0));
+        assert!(p.find(b"AxxxxBBB", 0, None).is_none());
+
+        let p = HexPattern::parse("41*42424242").unwrap();
+        assert_eq!(p.find(b"zzA----BBBB", 0, None), Some(2));
+
+        let p = HexPattern::parse("{1-4}414243").unwrap();
+        assert_eq!(p.find(b"xxxxABC", 0, None), Some(0));
+    }
+
+    #[test]
+    fn find_when_longest_literal_follows_non_alnum_or_line() {
+        let p = HexPattern::parse("41(W)424242").unwrap();
+        assert_eq!(p.find(b"xxA-BBB", 0, None), Some(2));
+        assert!(p.find(b"xxAxBBB", 0, None).is_none());
+
+        let p = HexPattern::parse("41(L)424242").unwrap();
+        assert_eq!(p.find(b"xxA\nBBB", 0, None), Some(2));
+        assert_eq!(p.find(b"xxA\r\nBBB", 0, None), Some(2));
+    }
+
+    #[test]
+    fn find_when_anchor_follows_variable_width_alt() {
+        let p = HexPattern::parse("41(42|4344)454545").unwrap();
+        assert_eq!(p.find(b"xxABEEE", 0, None), Some(2));
+        assert_eq!(p.find(b"xxACDEEE", 0, None), Some(2));
+        assert!(p.find(b"xxAFEEE", 0, None).is_none());
+    }
+
+    #[test]
+    fn match_tokens_survives_out_of_range_and_huge_skip() {
+        let p = HexPattern::parse(&format!("41{{{}}}42", usize::MAX)).unwrap();
+        assert!(!p.matches_at(b"AB", 0));
+        assert!(!p.matches_at(b"AB", usize::MAX));
+        assert!(p.find(b"AB", 0, None).is_none());
+
+        let p = HexPattern::parse("41(L)42").unwrap();
+        assert!(!p.matches_at(b"A\nB", 50));
+        assert!(!p.matches_at(b"A\nB", usize::MAX));
+
+        let p = HexPattern::parse("41(B)42").unwrap();
+        assert!(!p.matches_at(b"AB", 50));
+        assert!(!p.matches_at(&[], 1));
+    }
+
+    fn brute_find(p: &HexPattern, hay: &[u8], from: usize, to: Option<usize>) -> Option<usize> {
+        let end = to.unwrap_or(hay.len()).min(hay.len());
+        if from > end {
+            return None;
+        }
+        (from..=end).find(|&i| p.matches_at(hay, i))
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn find_agrees_with_brute_force_scan() {
+        let sigs = [
+            "414243",
+            "41{1-3}424242",
+            "41*42424242",
+            "41{-2}4243",
+            "41{2-}424242",
+            "??424242",
+            "41(W)424242",
+            "41(L)424242",
+            "41(42|4344)454647",
+            "{1-4}414243",
+            "41{0-8}42{0-8}434445",
+            "4?4243",
+            "4141*42",
+            "*424344",
+            "41{5-}4242",
+            "616263(42|434445)464748",
+            "41!(42)434445",
+            "64[2-4]616161",
+            "41(B)424242",
+        ];
+        let mut seed = 0xc0ff_eeu64;
+        let mut hays: Vec<Vec<u8>> = vec![
+            vec![],
+            b"A".to_vec(),
+            b"ABC".to_vec(),
+            b"xxABBB".to_vec(),
+            b"A-BBB".to_vec(),
+            b"A\nBBB".to_vec(),
+            b"A\r\nBBB".to_vec(),
+            (0u8..=40).collect(),
+        ];
+        for _ in 0..40 {
+            let n = 8 + (xorshift(&mut seed) as usize % 48);
+            hays.push((0..n).map(|_| xorshift(&mut seed) as u8 % 80).collect());
+        }
+        let froms = [0usize, 1, 2, 5, 16, 40, 80, 100];
+        let tos = [None, Some(0), Some(1), Some(8), Some(20), Some(64)];
+        for sig in sigs {
+            let p = HexPattern::parse(sig).unwrap();
+            for hay in &hays {
+                for &from in &froms {
+                    for &to in &tos {
+                        let got = p.find(hay, from, to);
+                        let exp = brute_find(&p, hay, from, to);
+                        assert_eq!(got, exp, "sig={sig} from={from} to={to:?} hay={hay:?}");
+                    }
+                }
+            }
+        }
     }
 }

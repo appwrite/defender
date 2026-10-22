@@ -461,11 +461,13 @@ impl Engine {
                         if !target_ok(rule.target, kind) {
                             continue;
                         }
-                        let pat_start = start.saturating_sub(rule.pattern.anchor_off);
-                        if !offset_ok(&rule.offset, pat_start, data.len(), pe.as_ref()) {
-                            continue;
-                        }
-                        if rule.pattern.matches_at(data, pat_start) && !self.is_ignored(&rule.name)
+                        if pattern_matches_at_anchor(
+                            &rule.pattern,
+                            &rule.offset,
+                            data,
+                            start,
+                            pe.as_ref(),
+                        ) && !self.is_ignored(&rule.name)
                         {
                             return Some(rule.name.clone());
                         }
@@ -483,11 +485,13 @@ impl Engine {
                             }
                         }
                         let sub = &rule.sig.subsigs[si];
-                        let pat_start = start.saturating_sub(sub.pattern.anchor_off);
-                        if !offset_ok(&sub.offset, pat_start, data.len(), pe.as_ref()) {
-                            continue;
-                        }
-                        if sub.pattern.matches_at(data, pat_start) {
+                        if pattern_matches_at_anchor(
+                            &sub.pattern,
+                            &sub.offset,
+                            data,
+                            start,
+                            pe.as_ref(),
+                        ) {
                             *counts.entry((li, si)).or_insert(0) += 1;
                             dirty.insert(li);
                         }
@@ -614,6 +618,21 @@ fn offset_ok(off: &OffsetKind, at: usize, len: usize, pe: Option<&PeImage>) -> b
             at >= base && at <= base + shift as usize
         }
     }
+}
+
+fn pattern_matches_at_anchor(
+    pattern: &HexPattern,
+    offset: &OffsetKind,
+    data: &[u8],
+    anchor_at: usize,
+    pe: Option<&PeImage>,
+) -> bool {
+    let Some(range) = pattern.candidate_start_range(anchor_at) else {
+        return false;
+    };
+    range.any(|pat_start| {
+        offset_ok(offset, pat_start, data.len(), pe) && pattern.matches_at(data, pat_start)
+    })
 }
 
 fn find_with_offset(
@@ -1039,6 +1058,25 @@ mod tests {
             pe_eng.scan(&mz).verdict,
             ScanVerdict::Infected { .. }
         ));
+    }
+
+    #[test]
+    fn body_sig_variable_skip_matches_shifted_payload() {
+        let ndb = "Test.VarSkip:0:*:41{1-3}42424242\n";
+        let cvd = pack_cvd(&[("t.ndb", ndb.as_bytes())], 1, "u").unwrap();
+        let eng = Engine::from_cvd_bytes("t", &cvd, VerifyMode::Integrity, false).unwrap();
+
+        let mut data = b"xxxx".to_vec();
+        data.push(b'A');
+        data.extend_from_slice(&[0x2c, 0x2c]);
+        data.extend_from_slice(b"BBBB");
+        match eng.scan(&data).verdict {
+            ScanVerdict::Infected { signature } => {
+                assert!(signature.contains("VarSkip"));
+            }
+            ScanVerdict::Clean => panic!("shifted variable-skip body signature not detected"),
+        }
+        assert!(matches!(eng.scan(b"nope").verdict, ScanVerdict::Clean));
     }
 
     #[test]
