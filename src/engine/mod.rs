@@ -451,6 +451,9 @@ impl Engine {
         let mut counts: FxHashMap<(usize, usize), u32> = FxHashMap::default();
         let mut dirty: FxHashSet<usize> = FxHashSet::default();
         let mut seen_logical: FxHashSet<(usize, usize, usize)> = FxHashSet::default();
+        let mut body_cores: FxHashMap<usize, PrefixCore> = FxHashMap::default();
+        let mut logical_cores: FxHashMap<(usize, usize), PrefixCore> = FxHashMap::default();
+        let mut logical_skip_hi: FxHashMap<(usize, usize), usize> = FxHashMap::default();
 
         if let Some(ac) = &self.ac {
             for m in ac.find_overlapping_iter(data) {
@@ -462,12 +465,14 @@ impl Engine {
                         if !target_ok(rule.target, kind) {
                             continue;
                         }
+                        let cores = prefix_core_for(&mut body_cores, ri, &rule.pattern, data);
                         if pattern_matches_at_anchor(
                             &rule.pattern,
                             &rule.offset,
                             data,
                             start,
                             pe.as_ref(),
+                            cores,
                         ) && !self.is_ignored(&rule.name)
                         {
                             return Some(rule.name.clone());
@@ -489,15 +494,49 @@ impl Engine {
                         let Some(range) = sub.pattern.candidate_start_range(start) else {
                             continue;
                         };
-                        for pat_start in range {
-                            if !offset_ok(&sub.offset, pat_start, data.len(), pe.as_ref())
-                                || !sub.pattern.matches_at(data, pat_start)
-                            {
-                                continue;
+                        let cores =
+                            prefix_core_for(&mut logical_cores, (li, si), &sub.pattern, data);
+                        let lo = *range.start();
+                        let hi = *range.end();
+                        match cores {
+                            Some([]) => {}
+                            Some(starts) => {
+                                if !sub.pattern.suffix_matches(data, start) {
+                                    continue;
+                                }
+                                for &pat_start in starts {
+                                    if pat_start < lo || pat_start > hi {
+                                        continue;
+                                    }
+                                    if !offset_ok(&sub.offset, pat_start, data.len(), pe.as_ref())
+                                        || !sub.pattern.matches_at(data, pat_start)
+                                    {
+                                        continue;
+                                    }
+                                    if seen_logical.insert((li, si, pat_start)) {
+                                        *counts.entry((li, si)).or_insert(0) += 1;
+                                        dirty.insert(li);
+                                    }
+                                }
                             }
-                            if seen_logical.insert((li, si, pat_start)) {
-                                *counts.entry((li, si)).or_insert(0) += 1;
-                                dirty.insert(li);
+                            None => {
+                                let prev = logical_skip_hi.get(&(li, si)).copied();
+                                let new_lo = prev.map(|p| p.saturating_add(1)).unwrap_or(lo);
+                                if new_lo > hi {
+                                    continue;
+                                }
+                                for pat_start in new_lo..=hi {
+                                    if !offset_ok(&sub.offset, pat_start, data.len(), pe.as_ref())
+                                        || !sub.pattern.matches_at(data, pat_start)
+                                    {
+                                        continue;
+                                    }
+                                    if seen_logical.insert((li, si, pat_start)) {
+                                        *counts.entry((li, si)).or_insert(0) += 1;
+                                        dirty.insert(li);
+                                    }
+                                }
+                                logical_skip_hi.insert((li, si), hi);
                             }
                         }
                     }
@@ -625,22 +664,63 @@ fn offset_ok(off: &OffsetKind, at: usize, len: usize, pe: Option<&PeImage>) -> b
     }
 }
 
+enum PrefixCore {
+    SkipOnly,
+    Starts(Vec<usize>),
+}
+
+fn prefix_core_for<'a, K: Eq + std::hash::Hash>(
+    cache: &'a mut FxHashMap<K, PrefixCore>,
+    key: K,
+    pattern: &HexPattern,
+    data: &[u8],
+) -> Option<&'a [usize]> {
+    let entry = cache
+        .entry(key)
+        .or_insert_with(|| match pattern.prefix_core_starts(data) {
+            None => PrefixCore::SkipOnly,
+            Some(v) => PrefixCore::Starts(v),
+        });
+    match entry {
+        PrefixCore::SkipOnly => None,
+        PrefixCore::Starts(v) => Some(v.as_slice()),
+    }
+}
+
 fn pattern_matches_at_anchor(
     pattern: &HexPattern,
     offset: &OffsetKind,
     data: &[u8],
     anchor_at: usize,
     pe: Option<&PeImage>,
+    core_starts: Option<&[usize]>,
 ) -> bool {
     let Some(range) = pattern.candidate_start_range(anchor_at) else {
         return false;
     };
-    for pat_start in range {
-        if offset_ok(offset, pat_start, data.len(), pe) && pattern.matches_at(data, pat_start) {
-            return true;
+    let lo = *range.start();
+    let hi = *range.end();
+    if let Some(cores) = core_starts {
+        if cores.is_empty() || !pattern.suffix_matches(data, anchor_at) {
+            return false;
         }
+        return cores.iter().any(|&s| {
+            s >= lo
+                && s <= hi
+                && offset_ok(offset, s, data.len(), pe)
+                && pattern.matches_at(data, s)
+        });
     }
-    false
+    const SMALL: usize = 64;
+    if hi.saturating_sub(lo) <= SMALL || pattern.anchor_max_off.is_some() {
+        return (lo..=hi).any(|pat_start| {
+            offset_ok(offset, pat_start, data.len(), pe) && pattern.matches_at(data, pat_start)
+        });
+    }
+    if !pattern.suffix_matches(data, anchor_at) {
+        return false;
+    }
+    offset_ok(offset, lo, data.len(), pe) && pattern.matches_at(data, lo)
 }
 
 fn find_with_offset(
@@ -1066,6 +1146,28 @@ mod tests {
             pe_eng.scan(&mz).verdict,
             ScanVerdict::Infected { .. }
         ));
+    }
+
+    #[test]
+    fn body_sig_unbounded_prefix_absent_core_is_clean() {
+        let ndb = "Test.AbsCore:0:*:4142*414141\n";
+        let cvd = pack_cvd(&[("t.ndb", ndb.as_bytes())], 1, "u").unwrap();
+        let eng = Engine::from_cvd_bytes("t", &cvd, VerifyMode::Integrity, false).unwrap();
+        assert!(matches!(
+            eng.scan(&vec![b'A'; 8192]).verdict,
+            ScanVerdict::Clean
+        ));
+
+        let mut hit = vec![0u8; 80];
+        hit[10] = b'A';
+        hit[11] = b'B';
+        hit[50] = b'A';
+        hit[51] = b'A';
+        hit[52] = b'A';
+        match eng.scan(&hit).verdict {
+            ScanVerdict::Infected { signature } => assert!(signature.contains("AbsCore")),
+            ScanVerdict::Clean => panic!("AB*AAA shifted match not detected"),
+        }
     }
 
     #[test]

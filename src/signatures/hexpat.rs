@@ -14,6 +14,8 @@ pub struct HexPattern {
     /// `None` when a preceding skip is unbounded. Equal to `Some(anchor_off)`
     /// when every token before the anchor has a single width.
     pub anchor_max_off: Option<usize>,
+    /// Index of the `Lit` token chosen as `anchor`.
+    anchor_idx: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,13 +86,25 @@ impl HexPattern {
                 .min(haystack.len()),
             None => haystack.len(),
         };
+        let (prefix_core, _) = split_unbounded_suffix(self.prefix_tokens());
+        let core_starts = if self.anchor_max_off.is_none() && !prefix_core.is_empty() {
+            let starts = collect_starts(&compile(prefix_core.to_vec()), haystack);
+            if starts.is_empty() {
+                return None;
+            }
+            Some(starts)
+        } else {
+            None
+        };
         let mut search_from = from.saturating_add(self.anchor_off);
         while let Some(window) = haystack.get(search_from..search_to) {
             let Some(rel) = find_slice(window, &self.anchor) else {
                 break;
             };
             let anchor_at = search_from + rel;
-            if let Some(start) = self.match_start_for_anchor(haystack, anchor_at, from, end) {
+            if let Some(start) =
+                self.match_start_for_anchor(haystack, anchor_at, from, end, core_starts.as_deref())
+            {
                 return Some(start);
             }
             search_from = anchor_at.saturating_add(1);
@@ -99,6 +113,31 @@ impl HexPattern {
             }
         }
         None
+    }
+
+    pub(crate) fn prefix_tokens(&self) -> &[Token] {
+        match self.anchor_idx {
+            Some(i) => &self.tokens[..i],
+            None => &[],
+        }
+    }
+
+    pub(crate) fn suffix_matches(&self, haystack: &[u8], anchor_at: usize) -> bool {
+        let Some(idx) = self.anchor_idx else {
+            return true;
+        };
+        let after = anchor_at.saturating_add(self.anchor.len());
+        match_tokens(&self.tokens[idx + 1..], haystack, after).is_some()
+    }
+
+    /// Starts of the prefix before a trailing unbounded skip, or `None` if the
+    /// prefix is skip-only. `Some([])` means that core never occurs in `hay`.
+    pub(crate) fn prefix_core_starts(&self, hay: &[u8]) -> Option<Vec<usize>> {
+        let (core, _) = split_unbounded_suffix(self.prefix_tokens());
+        if core.is_empty() {
+            return None;
+        }
+        Some(collect_starts(&compile(core.to_vec()), hay))
     }
 
     /// Pattern-start positions that could place `anchor` at `anchor_at`.
@@ -128,6 +167,7 @@ impl HexPattern {
         anchor_at: usize,
         from: usize,
         end: usize,
+        core_starts: Option<&[usize]>,
     ) -> Option<usize> {
         let range = self.candidate_start_range(anchor_at)?;
         let lo = (*range.start()).max(from);
@@ -135,18 +175,67 @@ impl HexPattern {
         if lo > hi {
             return None;
         }
-        (lo..=hi).find(|&start| self.matches_at(haystack, start))
+        const SMALL: usize = 64;
+        if let Some(cores) = core_starts {
+            if !self.suffix_matches(haystack, anchor_at) {
+                return None;
+            }
+            return cores
+                .iter()
+                .copied()
+                .find(|&s| s >= lo && s <= hi && self.matches_at(haystack, s));
+        }
+        if hi - lo <= SMALL || self.anchor_max_off.is_some() {
+            return (lo..=hi).find(|&start| self.matches_at(haystack, start));
+        }
+        if self.suffix_matches(haystack, anchor_at) && self.matches_at(haystack, lo) {
+            Some(lo)
+        } else {
+            None
+        }
     }
 }
 
 fn compile(tokens: Vec<Token>) -> HexPattern {
-    let (anchor, anchor_off, anchor_max_off) = longest_anchor(&tokens);
+    let (anchor, anchor_off, anchor_max_off, anchor_idx) = longest_anchor(&tokens);
     HexPattern {
         tokens,
         anchor,
         anchor_off,
         anchor_max_off,
+        anchor_idx,
     }
+}
+
+fn split_unbounded_suffix(tokens: &[Token]) -> (&[Token], usize) {
+    let mut min_skip = 0usize;
+    let mut last = tokens.len();
+    while last > 0 {
+        match &tokens[last - 1] {
+            Token::Skip { min, max: None } => {
+                min_skip = min_skip.saturating_add(*min);
+                last -= 1;
+            }
+            _ => break,
+        }
+    }
+    (&tokens[..last], min_skip)
+}
+
+fn collect_starts(pattern: &HexPattern, hay: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(s) = pattern.find(hay, from, None) {
+        out.push(s);
+        match s.checked_add(1) {
+            Some(next) if next <= hay.len() => from = next,
+            _ => break,
+        }
+        if from > hay.len() {
+            break;
+        }
+    }
+    out
 }
 
 fn find_slice(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -388,24 +477,26 @@ fn add_width(min: &mut usize, max: &mut Option<usize>, dmin: usize, dmax: Option
     };
 }
 
-fn longest_anchor(tokens: &[Token]) -> (Vec<u8>, usize, Option<usize>) {
+fn longest_anchor(tokens: &[Token]) -> (Vec<u8>, usize, Option<usize>, Option<usize>) {
     let mut best: &[u8] = &[];
     let mut best_min = 0usize;
     let mut best_max = Some(0usize);
+    let mut best_idx = None;
     let mut min_off = 0usize;
     let mut max_off = Some(0usize);
-    for t in tokens {
+    for (idx, t) in tokens.iter().enumerate() {
         if let Token::Lit(v) = t {
             if v.len() > best.len() {
                 best = v;
                 best_min = min_off;
                 best_max = max_off;
+                best_idx = Some(idx);
             }
         }
         let (dmin, dmax) = token_width(t);
         add_width(&mut min_off, &mut max_off, dmin, dmax);
     }
-    (best.to_vec(), best_min, best_max)
+    (best.to_vec(), best_min, best_max, best_idx)
 }
 
 fn remaining_ok(pos: usize, need: usize, hay_len: usize) -> bool {
@@ -731,6 +822,21 @@ mod tests {
         assert!(p.find(b"ABCD", 8, None).is_none());
         assert!(p.find(b"AB", 0, Some(1)).is_none());
         assert!(p.find(b"ABCD", 3, Some(3)).is_none());
+    }
+
+    #[test]
+    fn unbounded_prefix_skips_absent_core_without_quadratic_scan() {
+        let p = HexPattern::parse("4142*414141").unwrap();
+        let hay = vec![b'A'; 8192];
+        assert!(p.find(&hay, 0, None).is_none());
+
+        let mut hit = vec![0u8; 80];
+        hit[10] = b'A';
+        hit[11] = b'B';
+        hit[50] = b'A';
+        hit[51] = b'A';
+        hit[52] = b'A';
+        assert_eq!(p.find(&hit, 0, None), Some(10));
     }
 
     #[test]
