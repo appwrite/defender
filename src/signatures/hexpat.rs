@@ -76,8 +76,16 @@ impl HexPattern {
         if self.anchor.is_empty() {
             return (from..=end).find(|&i| self.matches_at(haystack, i));
         }
+        // `to` limits the pattern start, not how far the match may read.
+        let search_to = match self.anchor_max_off {
+            Some(max) => end
+                .saturating_add(max)
+                .saturating_add(self.anchor.len())
+                .min(haystack.len()),
+            None => haystack.len(),
+        };
         let mut search_from = from.saturating_add(self.anchor_off);
-        while let Some(window) = haystack.get(search_from..end) {
+        while let Some(window) = haystack.get(search_from..search_to) {
             let Some(rel) = find_slice(window, &self.anchor) else {
                 break;
             };
@@ -86,7 +94,7 @@ impl HexPattern {
                 return Some(start);
             }
             search_from = anchor_at.saturating_add(1);
-            if search_from >= end {
+            if search_from >= search_to {
                 break;
             }
         }
@@ -712,7 +720,8 @@ mod tests {
     #[test]
     fn find_does_not_panic_on_short_haystack_or_large_from() {
         let p = HexPattern::parse("41{1-3}424242").unwrap();
-        assert!(p.find(b"ABBB", 0, None).is_some());
+        assert!(p.find(b"AxBBB", 0, None).is_some());
+        assert!(p.find(b"ABBB", 0, None).is_none());
         assert!(p.find(b"xx", 0, None).is_none());
         assert!(p.find(b"", 0, None).is_none());
         assert!(p.find(b"ABC", 10, None).is_none());
@@ -731,7 +740,8 @@ mod tests {
         hay.extend_from_slice(&[0x11, 0x22]);
         hay.extend_from_slice(b"BBB");
         assert_eq!(p.find(&hay, 0, None), Some(4));
-        assert_eq!(p.find(b"ABBB", 0, None), Some(0));
+        assert_eq!(p.find(b"AxBBB", 0, None), Some(0));
+        assert!(p.find(b"ABBB", 0, None).is_none());
         assert!(p.find(b"AxxxxBBB", 0, None).is_none());
 
         let p = HexPattern::parse("41*42424242").unwrap();

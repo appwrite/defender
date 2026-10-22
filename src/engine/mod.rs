@@ -630,9 +630,12 @@ fn pattern_matches_at_anchor(
     let Some(range) = pattern.candidate_start_range(anchor_at) else {
         return false;
     };
-    range.any(|pat_start| {
-        offset_ok(offset, pat_start, data.len(), pe) && pattern.matches_at(data, pat_start)
-    })
+    for pat_start in range {
+        if offset_ok(offset, pat_start, data.len(), pe) && pattern.matches_at(data, pat_start) {
+            return true;
+        }
+    }
+    false
 }
 
 fn find_with_offset(
