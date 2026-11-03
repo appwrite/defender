@@ -31,7 +31,7 @@ tokio-stream = "=0.1.17"
 tower = "=0.5.2"
 tower-http = { version = "=0.6.2", features = ["limit", "trace", "timeout"] }
 tracing = "=0.1.41"
-tracing-subscriber = { version = "=0.3.19", features = ["env-filter"] }
+tracing-subscriber = { version = "=0.3.20", features = ["env-filter"] }
 
 # jemalloc returns unused pages after a CVD hot-reload; glibc typically does not.
 [target.'cfg(target_os = "linux")'.dependencies]
